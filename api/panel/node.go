@@ -3,6 +3,8 @@ package panel
 import (
 	"fmt"
 	"path"
+	"path/filepath"
+	"strconv"
 	"time"
 )
 
@@ -27,6 +29,37 @@ type NodeStatus struct {
 	Mem    float64
 	Disk   float64
 	Uptime uint64
+}
+
+func (n *NodeInfo) CertFilePath() string {
+	return filepath.Join("/etc/NPanel-node/", n.certBaseName()+".cer")
+}
+
+func (n *NodeInfo) KeyFilePath() string {
+	return filepath.Join("/etc/NPanel-node/", n.certBaseName()+".key")
+}
+
+func (n *NodeInfo) LegacyCertFilePath() string {
+	return filepath.Join("/etc/NPanel-node/", n.legacyCertBaseName()+".cer")
+}
+
+func (n *NodeInfo) LegacyKeyFilePath() string {
+	return filepath.Join("/etc/NPanel-node/", n.legacyCertBaseName()+".key")
+}
+
+func (n *NodeInfo) certBaseName() string {
+	base := n.legacyCertBaseName()
+	if n != nil && n.Protocol != nil && n.Protocol.Port > 0 {
+		return base + "-" + strconv.Itoa(n.Protocol.Port)
+	}
+	return base
+}
+
+func (n *NodeInfo) legacyCertBaseName() string {
+	if n == nil {
+		return ""
+	}
+	return n.Type + strconv.Itoa(n.Id)
 }
 
 func (c *ClientV1) ReportNodeStatus(nodeStatus *NodeStatus) (err error) {

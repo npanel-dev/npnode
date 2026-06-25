@@ -7,7 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"path/filepath"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -98,11 +98,22 @@ func buildInbound(nodeInfo *panel.NodeInfo, tag string) (*core.InboundHandlerCon
 				in.StreamSetting = &coreConf.StreamConfig{}
 			}
 			in.StreamSetting.Security = "tls"
+			certFile, keyFile := nodeInfo.CertFilePath(), nodeInfo.KeyFilePath()
+			if nodeInfo.Protocol.CertMode == "file" {
+				if _, err := os.Stat(certFile); err != nil {
+					legacyCert, legacyKey := nodeInfo.LegacyCertFilePath(), nodeInfo.LegacyKeyFilePath()
+					if _, certErr := os.Stat(legacyCert); certErr == nil {
+						if _, keyErr := os.Stat(legacyKey); keyErr == nil {
+							certFile, keyFile = legacyCert, legacyKey
+						}
+					}
+				}
+			}
 			in.StreamSetting.TLSSettings = &coreConf.TLSConfig{
 				Certs: []*coreConf.TLSCertConfig{
 					{
-						CertFile: filepath.Join("/etc/NPanel-node/", nodeInfo.Type+strconv.Itoa(nodeInfo.Id)+".cer"),
-						KeyFile:  filepath.Join("/etc/NPanel-node/", nodeInfo.Type+strconv.Itoa(nodeInfo.Id)+".key"),
+						CertFile: certFile,
+						KeyFile:  keyFile,
 					},
 				},
 			}

@@ -10,8 +10,6 @@ import (
 	"fmt"
 	"math/big"
 	"os"
-	"path/filepath"
-	"strconv"
 	"time"
 
 	"github.com/npanel-dev/npnode/common/file"
@@ -33,8 +31,8 @@ func (c *Controller) renewCertTask(_ context.Context) error {
 }
 
 func (c *Controller) requestCert() error {
-	certFile := filepath.Join("/etc/NPanel-node/", c.info.Type+strconv.Itoa(c.info.Id)+".cer")
-	keyFile := filepath.Join("/etc/NPanel-node/", c.info.Type+strconv.Itoa(c.info.Id)+".key")
+	certFile := c.info.CertFilePath()
+	keyFile := c.info.KeyFilePath()
 	switch c.info.Protocol.CertMode {
 	case "none", "", "file":
 	case "dns", "http":
