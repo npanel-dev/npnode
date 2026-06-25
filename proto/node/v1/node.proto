@@ -1,0 +1,209 @@
+syntax = "proto3";
+
+package npanel.node.v1;
+
+option go_package = "github.com/npanel-dev/npnode/proto/node/v1;nodev1";
+
+// NodeService provides the gRPC API for proxy nodes to communicate with the server.
+service NodeService {
+  // GetConfig returns the server configuration including protocols, DNS, outbound, etc.
+  rpc GetConfig(GetConfigRequest) returns (GetConfigResponse);
+
+  // GetUserList returns all authorized users for this server.
+  rpc GetUserList(GetUserListRequest) returns (GetUserListResponse);
+
+  // Sync establishes a bidirectional stream for continuous data exchange.
+  // The node sends traffic reports, online user updates, and status.
+  // The server pushes config changes and user list updates.
+  rpc Sync(stream SyncRequest) returns (stream SyncResponse);
+
+  // ReportStatus reports server health status (CPU, memory, disk).
+  rpc ReportStatus(ReportStatusRequest) returns (ReportStatusResponse);
+}
+
+// ========== GetConfig ==========
+
+message GetConfigRequest {
+  int64 server_id = 1;
+  string secret_key = 2;
+  repeated string protocols = 3; // optional filter: only return these protocols
+}
+
+message GetConfigResponse {
+  int64 traffic_report_threshold = 1;
+  string ip_strategy = 2;
+  repeated NodeDNS dns = 3;
+  repeated string block = 4;
+  repeated NodeOutbound outbound = 5;
+  repeated Protocol protocols = 6;
+  int64 total = 7;
+}
+
+message NodeDNS {
+  string proto = 1;
+  string address = 2;
+  repeated string domains = 3;
+}
+
+message NodeOutbound {
+  string name = 1;
+  string protocol = 2;
+  string address = 3;
+  int64 port = 4;
+  string password = 5;
+  repeated string rules = 6;
+}
+
+message Protocol {
+  string type = 1;
+  uint32 port = 2;
+  bool enable = 3;
+  // TLS / Security
+  string security = 4;
+  string sni = 5;
+  bool allow_insecure = 6;
+  string fingerprint = 7;
+  string reality_server_addr = 8;
+  int32 reality_server_port = 9;
+  string reality_private_key = 10;
+  string reality_public_key = 11;
+  string reality_short_id = 12;
+  // Transport
+  string transport = 13;
+  string host = 14;
+  string path = 15;
+  string service_name = 16;
+  // Shadowsocks
+  string cipher = 17;
+  string server_key = 18;
+  // VLESS
+  string flow = 19;
+  // Hysteria
+  string hop_ports = 20;
+  int32 hop_interval = 21;
+  string obfs_password = 22;
+  // Transport options
+  bool disable_sni = 23;
+  bool reduce_rtt = 24;
+  string udp_relay_mode = 25;
+  string congestion_controller = 26;
+  string multiplex = 27;
+  // Advanced
+  string padding_scheme = 28;
+  int32 up_mbps = 29;
+  int32 down_mbps = 30;
+  string obfs = 31;
+  string obfs_host = 32;
+  string obfs_path = 33;
+  string xhttp_mode = 34;
+  string xhttp_extra = 35;
+  // Encryption
+  string encryption = 36;
+  string encryption_mode = 37;
+  string encryption_rtt = 38;
+  string encryption_ticket = 39;
+  string encryption_server_padding = 40;
+  string encryption_private_key = 41;
+  string encryption_client_padding = 42;
+  string encryption_password = 43;
+  // ECH
+  bool ech_enable = 44;
+  string ech_server_name = 45;
+  // Certificate
+  double ratio = 46;
+  string cert_mode = 47;
+  string cert_dns_provider = 48;
+  string cert_dns_env = 49;
+}
+
+// ========== GetUserList ==========
+
+message GetUserListRequest {
+  int64 server_id = 1;
+  string secret_key = 2;
+  string protocol = 3;
+}
+
+message GetUserListResponse {
+  repeated UserEntry users = 1;
+}
+
+message UserEntry {
+  int64 id = 1;
+  string uuid = 2;
+  int64 speed_limit = 3;
+  int64 device_limit = 4;
+}
+
+// ========== Sync (Bidirectional Stream) ==========
+
+message SyncRequest {
+  oneof payload {
+    TrafficReport traffic = 1;
+    OnlineUserReport online_users = 2;
+    StatusReport status = 3;
+  }
+}
+
+message TrafficReport {
+  repeated TrafficEntry traffic = 1;
+}
+
+message TrafficEntry {
+  int64 uid = 1;   // user subscribe id
+  int64 upload = 2;
+  int64 download = 3;
+}
+
+message OnlineUserReport {
+  repeated OnlineUserEntry users = 1;
+}
+
+message OnlineUserEntry {
+  int64 uid = 1;  // user subscribe id
+  string ip = 2;
+}
+
+message StatusReport {
+  double cpu = 1;
+  double mem = 2;
+  double disk = 3;
+  int64 updated_at = 4;
+}
+
+message SyncResponse {
+  oneof payload {
+    UserListUpdate user_update = 1;
+    ConfigUpdate config_update = 2;
+  }
+}
+
+message UserListUpdate {
+  repeated UserEntry users = 1;
+  UserUpdateAction action = 2; // full or incremental
+}
+
+enum UserUpdateAction {
+  USER_UPDATE_FULL = 0;       // Replace entire list
+  USER_UPDATE_ADD = 1;        // Add users
+  USER_UPDATE_REMOVE = 2;     // Remove users
+}
+
+message ConfigUpdate {
+  string reason = 1; // why config was updated
+  int64 server_id = 2;
+}
+
+// ========== ReportStatus ==========
+
+message ReportStatusRequest {
+  int64 server_id = 1;
+  string secret_key = 2;
+  string protocol = 3;
+  double cpu = 4;
+  double mem = 5;
+  double disk = 6;
+  int64 updated_at = 7;
+}
+
+message ReportStatusResponse {}

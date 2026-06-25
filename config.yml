@@ -1,0 +1,16 @@
+Log:
+  Level: warn
+  Output:
+  Access: none
+
+Api:
+  ApiHost:
+  ServerID: 0
+  SecretKey:
+  Timeout: 30
+
+Grpc:
+  Enable: false
+  Addr:
+
+PprofPort: 0
