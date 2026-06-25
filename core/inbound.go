@@ -152,10 +152,11 @@ func buildInbound(nodeInfo *panel.NodeInfo, tag string) (*core.InboundHandlerCon
 }
 
 func buildStreamSetting(p *panel.Protocol) (*coreConf.StreamConfig, error) {
-	transport := p.Transport
-	if p.Obfs == "http" {
+	transport := normalizeTransport(p.Transport)
+	obfs := normalizeOptionalSetting(p.Obfs)
+	if obfs == "http" {
 		transport = "tcp"
-	} else if p.Obfs != "" {
+	} else if obfs != "" {
 		return nil, fmt.Errorf("unsupported obfs type: %s", p.Obfs)
 	}
 	t := coreConf.TransportProtocol(transport)
@@ -163,7 +164,7 @@ func buildStreamSetting(p *panel.Protocol) (*coreConf.StreamConfig, error) {
 	switch transport {
 	case "tcp":
 		stream.TCPSettings = &coreConf.TCPConfig{}
-		if p.Obfs == "http" {
+		if obfs == "http" {
 			obfsPath := p.ObfsPath
 			if obfsPath == "" {
 				obfsPath = "/"
@@ -293,7 +294,7 @@ func buildShadowsocks(nodeInfo *panel.NodeInfo, inbound *coreConf.InboundDetourC
 		Password: randomPasswd,
 	}
 	settings.Users = append(settings.Users, defaultSSuser)
-	if nodeInfo.Protocol.Obfs == "http" {
+	if normalizeOptionalSetting(nodeInfo.Protocol.Obfs) == "http" {
 		settings.NetworkList = &coreConf.NetworkList{"tcp"}
 	} else {
 		settings.NetworkList = &coreConf.NetworkList{"tcp", "udp"}
@@ -310,6 +311,24 @@ func buildShadowsocks(nodeInfo *panel.NodeInfo, inbound *coreConf.InboundDetourC
 	}
 	inbound.Settings = (*json.RawMessage)(&sets)
 	return nil
+}
+
+func normalizeOptionalSetting(value string) string {
+	value = strings.TrimSpace(strings.ToLower(value))
+	switch value {
+	case "", "none", "null", "false":
+		return ""
+	default:
+		return value
+	}
+}
+
+func normalizeTransport(value string) string {
+	value = normalizeOptionalSetting(value)
+	if value == "" {
+		return "tcp"
+	}
+	return value
 }
 
 func buildHysteria2(nodeInfo *panel.NodeInfo, inbound *coreConf.InboundDetourConfig) error {
