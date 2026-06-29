@@ -214,7 +214,18 @@ func buildStreamSetting(p *panel.Protocol) (*coreConf.StreamConfig, error) {
 	default:
 		return nil, fmt.Errorf("unsupported transport type: %s", transport)
 	}
+	applyProxyProtocolSockopt(stream, p.ProxyProtocol)
 	return stream, nil
+}
+
+func applyProxyProtocolSockopt(stream *coreConf.StreamConfig, enabled bool) {
+	if stream == nil || !enabled {
+		return
+	}
+	if stream.SocketSettings == nil {
+		stream.SocketSettings = &coreConf.SocketConfig{}
+	}
+	stream.SocketSettings.AcceptProxyProtocol = true
 }
 
 func buildVLess(nodeInfo *panel.NodeInfo, inbound *coreConf.InboundDetourConfig) error {
@@ -411,6 +422,7 @@ func buildAnyTLS(nodeInfo *panel.NodeInfo, inbound *coreConf.InboundDetourConfig
 	}
 	t := coreConf.TransportProtocol("tcp")
 	inbound.StreamSetting = &coreConf.StreamConfig{Network: &t}
+	applyProxyProtocolSockopt(inbound.StreamSetting, nodeInfo.Protocol.ProxyProtocol)
 	sets, err := json.Marshal(settings)
 	inbound.Settings = (*json.RawMessage)(&sets)
 	if err != nil {

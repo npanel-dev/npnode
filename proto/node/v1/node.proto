@@ -114,6 +114,7 @@ message Protocol {
   string cert_mode = 47;
   string cert_dns_provider = 48;
   string cert_dns_env = 49;
+  bool proxy_protocol = 50;
 }
 
 // ========== GetUserList ==========

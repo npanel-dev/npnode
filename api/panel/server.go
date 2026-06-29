@@ -55,6 +55,7 @@ type Protocol struct {
 	RealityPublicKey        string `json:"reality_public_key"`
 	RealityShortID          string `json:"reality_short_id"`
 	Transport               string `json:"transport"`
+	ProxyProtocol           bool   `json:"proxy_protocol"`
 	Host                    string `json:"host"`
 	Path                    string `json:"path"`
 	ServiceName             string `json:"service_name"`

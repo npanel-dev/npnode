@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/npanel-dev/npnode/api/panel"
+	coreConf "github.com/xtls/xray-core/infra/conf"
 )
 
 func TestBuildInboundTreatsNoneObfsAsEmpty(t *testing.T) {
@@ -28,4 +29,86 @@ func TestNormalizeOptionalSetting(t *testing.T) {
 			t.Fatalf("normalizeOptionalSetting(%q) = %q, want empty", value, got)
 		}
 	}
+}
+
+func TestBuildStreamSettingEnablesProxyProtocol(t *testing.T) {
+	stream, err := buildStreamSetting(&panel.Protocol{
+		Transport:     "tcp",
+		ProxyProtocol: true,
+	})
+	if err != nil {
+		t.Fatalf("buildStreamSetting returned error: %v", err)
+	}
+	if !acceptProxyProtocolEnabled(stream) {
+		t.Fatal("proxy protocol should enable sockopt.acceptProxyProtocol")
+	}
+}
+
+func TestBuildStreamSettingLeavesProxyProtocolDisabled(t *testing.T) {
+	stream, err := buildStreamSetting(&panel.Protocol{
+		Transport: "tcp",
+	})
+	if err != nil {
+		t.Fatalf("buildStreamSetting returned error: %v", err)
+	}
+	if acceptProxyProtocolEnabled(stream) {
+		t.Fatal("proxy protocol should stay disabled by default")
+	}
+}
+
+func TestBuildAnyTLSEnablesProxyProtocol(t *testing.T) {
+	inbound := &coreConf.InboundDetourConfig{}
+	err := buildAnyTLS(&panel.NodeInfo{
+		Type: "anytls",
+		Protocol: &panel.Protocol{
+			Type:          "anytls",
+			ProxyProtocol: true,
+		},
+	}, inbound)
+	if err != nil {
+		t.Fatalf("buildAnyTLS returned error: %v", err)
+	}
+	if !acceptProxyProtocolEnabled(inbound.StreamSetting) {
+		t.Fatal("anytls proxy protocol should enable sockopt.acceptProxyProtocol")
+	}
+}
+
+func TestBuildHysteria2IgnoresProxyProtocol(t *testing.T) {
+	inbound := &coreConf.InboundDetourConfig{}
+	err := buildHysteria2(&panel.NodeInfo{
+		Type: "hysteria2",
+		Protocol: &panel.Protocol{
+			Type:          "hysteria2",
+			ProxyProtocol: true,
+		},
+	}, inbound)
+	if err != nil {
+		t.Fatalf("buildHysteria2 returned error: %v", err)
+	}
+	if acceptProxyProtocolEnabled(inbound.StreamSetting) {
+		t.Fatal("hysteria2 should not enable proxy protocol in P0")
+	}
+}
+
+func TestBuildTuicIgnoresProxyProtocol(t *testing.T) {
+	inbound := &coreConf.InboundDetourConfig{}
+	err := buildTuic(&panel.NodeInfo{
+		Type: "tuic",
+		Protocol: &panel.Protocol{
+			Type:          "tuic",
+			ProxyProtocol: true,
+		},
+	}, inbound)
+	if err != nil {
+		t.Fatalf("buildTuic returned error: %v", err)
+	}
+	if acceptProxyProtocolEnabled(inbound.StreamSetting) {
+		t.Fatal("tuic should not enable proxy protocol in P0")
+	}
+}
+
+func acceptProxyProtocolEnabled(stream *coreConf.StreamConfig) bool {
+	return stream != nil &&
+		stream.SocketSettings != nil &&
+		stream.SocketSettings.AcceptProxyProtocol
 }
