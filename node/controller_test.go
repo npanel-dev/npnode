@@ -55,3 +55,29 @@ func TestHasSameProtocolDifferentPortsIgnoresDisabledProtocols(t *testing.T) {
 		t.Fatal("disabled protocols should not trigger multi-port detection")
 	}
 }
+
+func TestOnlineUsersForReportReturnsNonNilEmptySnapshot(t *testing.T) {
+	report := onlineUsersForReport(nil, nil)
+	if report == nil {
+		t.Fatal("empty online snapshot must be a non-nil slice so HTTP reports users: []")
+	}
+	if len(report) != 0 {
+		t.Fatalf("empty online snapshot length = %d, want 0", len(report))
+	}
+}
+
+func TestOnlineUsersForReportPreservesFiltering(t *testing.T) {
+	report := onlineUsersForReport(
+		[]panel.OnlineUser{
+			{UID: 1, IP: "203.0.113.1"},
+			{UID: 2, IP: "203.0.113.2"},
+		},
+		[]panel.UserTraffic{
+			{UID: 1, Upload: 0, Download: 0},
+			{UID: 2, Upload: 1, Download: 0},
+		},
+	)
+	if len(report) != 1 || report[0].UID != 2 {
+		t.Fatalf("online report = %+v, want only UID 2", report)
+	}
+}

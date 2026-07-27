@@ -184,20 +184,8 @@ func (c *Controller) reportUserTrafficTask(ctx context.Context) (err error) {
 		// Report online users via Sync stream
 		if onlineDevice, err := c.limiter.GetOnlineDevice(); err != nil {
 			log.Print(err)
-		} else if len(*onlineDevice) > 0 {
-			var result []panel.OnlineUser
-			var nocountUID = make(map[int]struct{})
-			for _, traffic := range userTraffic {
-				total := traffic.Upload + traffic.Download
-				if total <= 0 {
-					nocountUID[traffic.UID] = struct{}{}
-				}
-			}
-			for _, online := range *onlineDevice {
-				if _, ok := nocountUID[online.UID]; !ok {
-					result = append(result, online)
-				}
-			}
+		} else {
+			result := onlineUsersForReport(*onlineDevice, userTraffic)
 			if err = c.grpcClient.SendOnlineUsers(result); err != nil {
 				log.WithFields(log.Fields{
 					"tag": c.tag,
@@ -235,20 +223,8 @@ func (c *Controller) reportUserTrafficTask(ctx context.Context) (err error) {
 
 		if onlineDevice, err := c.limiter.GetOnlineDevice(); err != nil {
 			log.Print(err)
-		} else if len(*onlineDevice) > 0 {
-			var result []panel.OnlineUser
-			var nocountUID = make(map[int]struct{})
-			for _, traffic := range userTraffic {
-				total := traffic.Upload + traffic.Download
-				if total <= 0 {
-					nocountUID[traffic.UID] = struct{}{}
-				}
-			}
-			for _, online := range *onlineDevice {
-				if _, ok := nocountUID[online.UID]; !ok {
-					result = append(result, online)
-				}
-			}
+		} else {
+			result := onlineUsersForReport(*onlineDevice, userTraffic)
 			if err = c.apiClient.ReportNodeOnlineUsers(ctx, &result); err != nil {
 				log.WithFields(log.Fields{
 					"tag": c.tag,
@@ -277,6 +253,22 @@ func (c *Controller) reportUserTrafficTask(ctx context.Context) (err error) {
 
 	userTraffic = nil
 	return nil
+}
+
+func onlineUsersForReport(onlineDevices []panel.OnlineUser, userTraffic []panel.UserTraffic) []panel.OnlineUser {
+	result := make([]panel.OnlineUser, 0, len(onlineDevices))
+	noCountUID := make(map[int]struct{})
+	for _, traffic := range userTraffic {
+		if traffic.Upload+traffic.Download <= 0 {
+			noCountUID[traffic.UID] = struct{}{}
+		}
+	}
+	for _, online := range onlineDevices {
+		if _, excluded := noCountUID[online.UID]; !excluded {
+			result = append(result, online)
+		}
+	}
+	return result
 }
 
 func compareUserList(old, new []panel.UserInfo) (deleted, added []panel.UserInfo) {
