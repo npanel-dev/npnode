@@ -33,7 +33,7 @@ GOEXPERIMENT=jsonv2 go test ./core -run '^TestVLESSWildcardInboundPreservesEntry
 ### 一键安装
 
 ```
-wget -N https://raw.githubusercontent.com/npanel-dev/npnode/main/scripts/install.sh && bash install.sh
+wget -N https://raw.githubusercontent.com/yunsen1599/NPnode-release/main/scripts/install.sh && bash install.sh
 ```
 
 ## 构建
