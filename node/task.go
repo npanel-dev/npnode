@@ -79,7 +79,7 @@ func (c *Controller) userListMonitor(ctx context.Context) (err error) {
 	// get user info — prefer gRPC if available
 	var newU []panel.UserInfo
 	if c.grpcClient != nil {
-		newU, err = c.grpcClient.GetUserList(ctx, c.info.Type)
+		newU, err = c.grpcClient.GetUserList(ctx, c.info.Type, c.info.Protocol.Port)
 		if err != nil {
 			log.WithFields(log.Fields{
 				"tag": c.tag,

@@ -2,7 +2,6 @@ package node
 
 import (
 	"fmt"
-	"strings"
 
 	"github.com/npanel-dev/npnode/api/panel"
 	"github.com/npanel-dev/npnode/conf"
@@ -27,7 +26,6 @@ func New(core *vCore.XrayCore, config *conf.Conf, serverconfig *panel.ServerConf
 	if pullinterval <= 0 {
 		pullinterval = 60
 	}
-	disableGrpc := hasSameProtocolDifferentPorts(serverconfig.Data.Protocols)
 	for i, nodeconfig := range *serverconfig.Data.Protocols {
 		n := &panel.NodeInfo{
 			Id:                     config.ApiConfig.ServerId,
@@ -49,7 +47,8 @@ func New(core *vCore.XrayCore, config *conf.Conf, serverconfig *panel.ServerConf
 		}
 		controller := NewController(core, p, n)
 		controller.traffic = node.traffic
-		if grpcClient != nil && !disableGrpc {
+		// gRPC 用户列表按协议+端口区分，同协议多端口也可以走 gRPC
+		if grpcClient != nil {
 			controller.SetGrpcClient(grpcClient)
 		}
 		node.controllers[i] = controller
@@ -96,26 +95,4 @@ func (n *Node) Close() {
 		}
 	}
 	n.controllers = nil
-}
-
-func hasSameProtocolDifferentPorts(protocols *[]panel.Protocol) bool {
-	if protocols == nil {
-		return false
-	}
-	portsByType := make(map[string]map[int]struct{})
-	for _, protocol := range *protocols {
-		if !protocol.Enable {
-			continue
-		}
-		protocolType := strings.ToLower(protocol.Type)
-		ports, ok := portsByType[protocolType]
-		if !ok {
-			portsByType[protocolType] = map[int]struct{}{protocol.Port: {}}
-			continue
-		}
-		if _, exists := ports[protocol.Port]; !exists {
-			return true
-		}
-	}
-	return false
 }

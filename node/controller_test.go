@@ -33,29 +33,6 @@ func TestBuildNodeTagFallsBackWithoutPort(t *testing.T) {
 	}
 }
 
-func TestHasSameProtocolDifferentPorts(t *testing.T) {
-	protocols := []panel.Protocol{
-		{Type: "vless", Port: 8443, Enable: true},
-		{Type: "vless", Port: 9443, Enable: true},
-		{Type: "trojan", Port: 443, Enable: true},
-	}
-
-	if !hasSameProtocolDifferentPorts(&protocols) {
-		t.Fatal("expected same protocol with different ports to be detected")
-	}
-}
-
-func TestHasSameProtocolDifferentPortsIgnoresDisabledProtocols(t *testing.T) {
-	protocols := []panel.Protocol{
-		{Type: "vless", Port: 8443, Enable: true},
-		{Type: "vless", Port: 9443, Enable: false},
-	}
-
-	if hasSameProtocolDifferentPorts(&protocols) {
-		t.Fatal("disabled protocols should not trigger multi-port detection")
-	}
-}
-
 func TestOnlineUsersForReportReturnsNonNilEmptySnapshot(t *testing.T) {
 	report := onlineUsersForReport(nil, nil)
 	if report == nil {

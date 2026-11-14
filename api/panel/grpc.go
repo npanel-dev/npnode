@@ -149,13 +149,18 @@ func (g *GrpcClient) GetConfig(ctx context.Context, protocols []string) (*nodev1
 }
 
 // GetUserList fetches the authorized user list for a given protocol.
-func (g *GrpcClient) GetUserList(ctx context.Context, protocol string) ([]UserInfo, error) {
+// port 为入站端口：同一服务器同协议可能有多个端口，用户列表按端口区分。
+func (g *GrpcClient) GetUserList(ctx context.Context, protocol string, port int) ([]UserInfo, error) {
 	ctx = g.authContext(ctx)
-	resp, err := g.client.GetUserList(ctx, &nodev1.GetUserListRequest{
+	req := &nodev1.GetUserListRequest{
 		ServerId:  g.serverID,
 		SecretKey: g.secretKey,
 		Protocol:  protocol,
-	})
+	}
+	if port > 0 && port <= 65535 {
+		req.Port = uint32(port)
+	}
+	resp, err := g.client.GetUserList(ctx, req)
 	if err != nil {
 		st := status.Convert(err)
 		return nil, fmt.Errorf("GetUserList failed: %s (code=%s)", st.Message(), st.Code())

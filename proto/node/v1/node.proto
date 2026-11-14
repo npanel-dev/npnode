@@ -37,6 +37,9 @@ message GetConfigResponse {
   repeated NodeOutbound outbound = 5;
   repeated Protocol protocols = 6;
   int64 total = 7;
+  // 节点拉取配置/用户列表、上报流量的间隔（秒），0 时节点使用默认值。
+  int64 pull_interval = 8;
+  int64 push_interval = 9;
 }
 
 message NodeDNS {
@@ -123,6 +126,8 @@ message GetUserListRequest {
   int64 server_id = 1;
   string secret_key = 2;
   string protocol = 3;
+  // 入站端口：同一服务器同协议可能有多个端口，用户列表按端口区分。0 表示不区分。
+  uint32 port = 4;
 }
 
 message GetUserListResponse {

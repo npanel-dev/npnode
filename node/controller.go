@@ -48,7 +48,7 @@ func (c *Controller) Start() error {
 	var err error
 	// Update user — prefer gRPC
 	if c.grpcClient != nil {
-		c.userList, err = c.grpcClient.GetUserList(context.Background(), c.info.Type)
+		c.userList, err = c.grpcClient.GetUserList(context.Background(), c.info.Type, c.info.Protocol.Port)
 		if err != nil {
 			return fmt.Errorf("gRPC get user list error: %s", err)
 		}
