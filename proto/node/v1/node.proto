@@ -150,7 +150,21 @@ message SyncRequest {
     StatusReport status = 3;
     // 订阅入站的用户变更推送；也用于版本断档后重新获取全量
     Subscribe subscribe = 4;
+    // 入站证书状态（http / dns 模式申请 / 续期的结果）
+    CertReport cert = 5;
   }
+}
+
+// CertReport 一个入站的证书状态：申请失败时入站不启动（不使用自签证书），由面板展示原因。
+message CertReport {
+  string protocol = 1;
+  uint32 port = 2;
+  string domain = 3;
+  string mode = 4;       // http / dns
+  bool ok = 5;           // 证书可用（入站已用它启动）
+  string error = 6;      // 失败原因；续期失败但旧证书仍有效时 ok=true 且带 error
+  int64 not_after = 7;   // 证书到期时间（unix 秒），没有证书为 0
+  int64 checked_at = 8;  // 节点检查时间（unix 秒）
 }
 
 message Subscribe {

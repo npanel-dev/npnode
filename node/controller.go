@@ -2,6 +2,7 @@ package node
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -34,7 +35,10 @@ type Controller struct {
 	userListMonitorPeriodic *task.Task
 	userReportPeriodic      *task.Task
 	renewCertPeriodic       *task.Task
-	onlineIpReportPeriodic  *task.Task
+	// started 入站已加入内核；证书不可用时为 false，由 certRetryStop 对应的协程定时重试
+	started                bool
+	certRetryStop          chan struct{}
+	onlineIpReportPeriodic *task.Task
 }
 
 // NewController return a Node controller with default parameters.
@@ -86,7 +90,13 @@ func (c *Controller) Start() error {
 	if c.info.Protocol.Security == "tls" {
 		err = c.requestCert()
 		if err != nil {
-			return fmt.Errorf("request cert error: %s", err)
+			if errors.Is(err, errCertPending) {
+				// 不用错误的证书启动：撤掉限速器，定时重试，成功后重载节点
+				limiter.DeleteLimiter(c.tag)
+				c.limiter = nil
+				c.startCertRetry()
+			}
+			return fmt.Errorf("request cert error: %w", err)
 		}
 	}
 	// Add new tag
@@ -104,11 +114,16 @@ func (c *Controller) Start() error {
 	}
 	log.WithField("节点", c.tag).Infof("已添加 %d 个新用户", added)
 	c.startTasks(c.info)
+	c.started = true
 	return nil
 }
 
 // Close implement the Close() function of the service interface
 func (c *Controller) Close() error {
+	c.stopCertRetry()
+	if !c.started {
+		return nil // 入站没有启动（证书不可用），没有可清理的
+	}
 	limiter.DeleteLimiter(c.tag)
 	if c.userListMonitorPeriodic != nil {
 		c.userListMonitorPeriodic.Close()

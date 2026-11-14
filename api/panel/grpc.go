@@ -46,6 +46,10 @@ type GrpcClient struct {
 	// bootID + reportSeq 组成流量上报 ID
 	bootID    string
 	reportSeq atomic.Uint64
+
+	// certReports 各入站最近一次证书状态；流连上（收到 Hello）时全部补发
+	certMu      sync.Mutex
+	certReports map[string]*nodev1.CertReport
 }
 
 // parseGrpcAddr parses a URL-style address into a gRPC target and TLS status.
@@ -291,6 +295,40 @@ func (g *GrpcClient) NewTrafficReportID() string {
 	return fmt.Sprintf("%s:%d", g.bootID, g.reportSeq.Add(1))
 }
 
+// ReportCert 记录入站证书状态并尽量立即发送；流未连上时等连上后补发。
+func (g *GrpcClient) ReportCert(r *nodev1.CertReport) {
+	if g == nil || r == nil {
+		return
+	}
+	key := fmt.Sprintf("%s:%d", r.GetProtocol(), r.GetPort())
+	g.certMu.Lock()
+	if g.certReports == nil {
+		g.certReports = make(map[string]*nodev1.CertReport)
+	}
+	g.certReports[key] = r
+	g.certMu.Unlock()
+	if g.IsSyncConnected() {
+		if err := g.sendSync(&nodev1.SyncRequest{Payload: &nodev1.SyncRequest_Cert{Cert: r}}); err != nil {
+			log.Debugf("[grpc.Sync] 发送证书状态失败，连上后补发: %v", err)
+		}
+	}
+}
+
+func (g *GrpcClient) flushCertReports() {
+	g.certMu.Lock()
+	list := make([]*nodev1.CertReport, 0, len(g.certReports))
+	for _, r := range g.certReports {
+		list = append(list, r)
+	}
+	g.certMu.Unlock()
+	for _, r := range list {
+		if err := g.sendSync(&nodev1.SyncRequest{Payload: &nodev1.SyncRequest_Cert{Cert: r}}); err != nil {
+			log.Debugf("[grpc.Sync] 补发证书状态失败: %v", err)
+			return
+		}
+	}
+}
+
 // sendSync 串行发送：gRPC 流的 Send 不支持并发调用，多个入站和心跳共用一条流。
 func (g *GrpcClient) sendSync(req *nodev1.SyncRequest) error {
 	g.mu.Lock()
@@ -514,6 +552,7 @@ func (g *GrpcClient) runSyncLoop(handler SyncHandler, done <-chan struct{}) {
 						log.Warnf("[grpc.Sync] 订阅用户推送失败，继续靠定时拉取: %v", err)
 					}
 				}
+				g.flushCertReports()
 			}
 		}
 

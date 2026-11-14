@@ -1,7 +1,9 @@
 package node
 
 import (
+	"errors"
 	"fmt"
+	log "github.com/sirupsen/logrus"
 
 	"github.com/npanel-dev/npnode/api/panel"
 	"github.com/npanel-dev/npnode/conf"
@@ -80,6 +82,11 @@ func (n *Node) Start() error {
 			continue
 		}
 		err := n.controllers[i].Start()
+		if errors.Is(err, errCertPending) {
+			// 证书不可用的入站不启动，其他入站照常运行；失败原因已同步给面板，之后自动重试
+			log.WithFields(log.Fields{"协议": n.controllers[i].info.Type, "端口": n.controllers[i].info.Protocol.Port, "err": err}).Error("入站因证书不可用暂不启动")
+			continue
+		}
 		if err != nil {
 			return fmt.Errorf("启动节点 [%s-%s-%d-%d] 失败: %s",
 				n.controllers[i].apiClient.APIHost,

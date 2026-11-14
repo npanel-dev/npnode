@@ -185,7 +185,7 @@ func (n *Node) OnConfigUpdate(reason string) {
 func (n *Node) SyncInbounds() []panel.Inbound {
 	var out []panel.Inbound
 	for _, c := range n.controllers {
-		if c == nil || c.grpcClient == nil || !c.info.Protocol.Enable {
+		if c == nil || c.grpcClient == nil || !c.info.Protocol.Enable || !c.started {
 			continue
 		}
 		out = append(out, panel.Inbound{Protocol: c.info.Type, Port: c.info.Protocol.Port})
