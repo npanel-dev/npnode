@@ -33,12 +33,14 @@ type XrayCore struct {
 	Client                      *panel.ClientV2
 	ReloadCh                    chan struct{}
 	serverConfigMonitorPeriodic *task.Task
-	access                      sync.Mutex
-	Server                      *core.Instance
-	users                       *UserMap
-	ihm                         inbound.Manager
-	ohm                         outbound.Manager
-	dispatcher                  *dispatcher.DefaultDispatcher
+	// configCheckMu 串行化配置检查：定时检查与面板推送触发的检查共用 ETag / 响应哈希状态
+	configCheckMu sync.Mutex
+	access        sync.Mutex
+	Server        *core.Instance
+	users         *UserMap
+	ihm           inbound.Manager
+	ohm           outbound.Manager
+	dispatcher    *dispatcher.DefaultDispatcher
 }
 
 type UserMap struct {
@@ -138,6 +140,13 @@ func getCore(c *conf.Conf, serverconfig *panel.ServerConfigResponse) *core.Insta
 	return server
 }
 
+// CheckServerConfigNow 立即检查一次服务端配置（面板推送配置变更时调用），有变化则触发重载。
+func (c *XrayCore) CheckServerConfigNow() {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	_ = c.ServerConfigMonitor(ctx)
+}
+
 func (c *XrayCore) startTasks(serverconfig *panel.ServerConfigResponse) {
 	// fetch node info task
 	pullinverval := serverconfig.Data.PullInterval
@@ -153,6 +162,8 @@ func (c *XrayCore) startTasks(serverconfig *panel.ServerConfigResponse) {
 }
 
 func (c *XrayCore) ServerConfigMonitor(ctx context.Context) (err error) {
+	c.configCheckMu.Lock()
+	defer c.configCheckMu.Unlock()
 	newServerConfig, err := panel.GetServerConfig(ctx, c.Client)
 	if err != nil {
 		log.WithField("err", err).Error("获取服务端配置失败")

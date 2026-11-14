@@ -164,8 +164,23 @@ func (n *Node) OnUserUpdate(u panel.UserUpdate) {
 	}
 }
 
-// OnConfigUpdate 配置推送在后续阶段接入，目前仍靠定时检查配置
-func (n *Node) OnConfigUpdate(string) {}
+// OnConfigUpdate 面板通知配置变了：立即走一次带 ETag 的配置检查（有变化才重载），
+// 不必等定时检查。在单独的协程里做，避免阻塞 Sync 接收循环；连续通知合并成一次。
+func (n *Node) OnConfigUpdate(reason string) {
+	if n.core == nil {
+		return
+	}
+	select {
+	case n.configCheck <- struct{}{}:
+	default:
+		return // 已有一次检查在排队
+	}
+	log.WithField("reason", reason).Info("收到面板配置变更通知，立即检查配置")
+	go func() {
+		<-n.configCheck
+		n.core.CheckServerConfigNow()
+	}()
+}
 
 func (n *Node) SyncInbounds() []panel.Inbound {
 	var out []panel.Inbound

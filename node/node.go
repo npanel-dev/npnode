@@ -11,12 +11,17 @@ import (
 type Node struct {
 	controllers []*Controller
 	traffic     *trafficQueue
+	core        *vCore.XrayCore
+	// configCheck 合并面板连续推送的配置变更：已有检查在排队时不再重复
+	configCheck chan struct{}
 }
 
 func New(core *vCore.XrayCore, config *conf.Conf, serverconfig *panel.ServerConfigResponse, grpcClient *panel.GrpcClient) (*Node, error) {
 	node := &Node{
 		controllers: make([]*Controller, len(*serverconfig.Data.Protocols)),
 		traffic:     newTrafficQueue(),
+		core:        core,
+		configCheck: make(chan struct{}, 1),
 	}
 	pushinterval := serverconfig.Data.PushInterval
 	if pushinterval <= 0 {

@@ -63,7 +63,7 @@ func (p *pushPanel) Sync(stream nodev1.NodeService_SyncServer) error {
 
 func (p *pushPanel) push(t *testing.T, u *nodev1.UserListUpdate) {
 	t.Helper()
-	u.Protocol, u.Port = "shadowsocks", u.Port
+	u.Protocol = "shadowsocks"
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if err := p.stream.Send(&nodev1.SyncResponse{Payload: &nodev1.SyncResponse_UserUpdate{UserUpdate: u}}); err != nil {
