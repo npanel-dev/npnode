@@ -207,11 +207,13 @@ func (g *GrpcClient) StartSync(ctx context.Context, handler SyncHandler) {
 		g.mu.Unlock()
 		return // already running
 	}
-	g.syncDone = make(chan struct{})
+	done := make(chan struct{})
+	g.syncDone = done
 	g.syncCtx = ctx
 	g.mu.Unlock()
 
-	go g.runSyncLoop(handler)
+	// done 作为参数传入：Close 会把 g.syncDone 置空，循环里不能再读这个字段
+	go g.runSyncLoop(handler, done)
 }
 
 // SyncHandler handles incoming messages from the Sync stream.
@@ -285,17 +287,18 @@ func (g *GrpcClient) IsSyncConnected() bool {
 
 // ========== Internal ==========
 
-func (g *GrpcClient) runSyncLoop(handler SyncHandler) {
+func (g *GrpcClient) runSyncLoop(handler SyncHandler, done <-chan struct{}) {
 	backoff := backoff.Config{
 		BaseDelay:  1.0 * time.Second,
 		Multiplier: 2.0,
 		MaxDelay:   30 * time.Second,
 	}
 	delay := time.Duration(0)
+	unimplementedLogged := false
 
 	for {
 		select {
-		case <-g.syncDone:
+		case <-done:
 			return
 		default:
 		}
@@ -303,7 +306,7 @@ func (g *GrpcClient) runSyncLoop(handler SyncHandler) {
 		if delay > 0 {
 			select {
 			case <-time.After(delay):
-			case <-g.syncDone:
+			case <-done:
 				return
 			}
 		}
@@ -316,28 +319,49 @@ func (g *GrpcClient) runSyncLoop(handler SyncHandler) {
 			continue
 		}
 
-		g.mu.Lock()
-		g.sync = stream
-		g.mu.Unlock()
-		delay = 0 // reset on successful connection
+		// 流建立后先观察一段时间再标记为可用：服务端拒绝（如 Unimplemented）时错误在第一次 Recv 才返回，
+		// 若立刻标记可用，这期间的流量上报会走这条流并丢失。
+		connectedAt := time.Now()
+		var streamActive = true
+		markReady := time.AfterFunc(syncReadyDelay, func() {
+			g.mu.Lock()
+			if streamActive {
+				g.sync = stream
+			}
+			g.mu.Unlock()
+		})
 
-		log.Info("[grpc.Sync] stream connected")
+		log.Info("[grpc.Sync] stream opened")
 
 		// Heartbeat: send keepalive Status every 30s to prevent Cloudflare 524 timeout
 		streamDone := make(chan struct{})
 		go g.syncHeartbeat(stream, streamDone)
 
 		// Read loop: receive server pushes
+		var recvErr error
 		for {
 			resp, err := stream.Recv()
 			if err != nil {
-				if err == io.EOF || status.Code(err) == codes.Canceled || status.Code(err) == codes.DeadlineExceeded {
+				recvErr = err
+				switch {
+				case status.Code(err) == codes.Unimplemented:
+					if !unimplementedLogged {
+						log.Warnf("[grpc.Sync] 面板未开启 Sync 推送，流量继续走 HTTP，每 %s 重试一次", syncUnimplementedRetry)
+						unimplementedLogged = true
+					}
+				case err == io.EOF || status.Code(err) == codes.Canceled || status.Code(err) == codes.DeadlineExceeded:
 					log.Infof("[grpc.Sync] stream closed: %v", err)
-				} else {
+				default:
 					log.Errorf("[grpc.Sync] Recv error: %v", err)
 				}
 				break
 			}
+			// 收到服务端消息说明流可用
+			g.mu.Lock()
+			if streamActive && g.sync == nil {
+				g.sync = stream
+			}
+			g.mu.Unlock()
 
 			switch payload := resp.Payload.(type) {
 			case *nodev1.SyncResponse_UserUpdate:
@@ -361,14 +385,36 @@ func (g *GrpcClient) runSyncLoop(handler SyncHandler) {
 		}
 
 		close(streamDone)
+		markReady.Stop()
 
 		g.mu.Lock()
+		streamActive = false
 		g.sync = nil
 		g.mu.Unlock()
 
-		delay = nextBackoff(backoff, delay)
+		switch {
+		case status.Code(recvErr) == codes.Unimplemented:
+			// 面板不支持 Sync：低频重试，避免每秒请求面板
+			delay = syncUnimplementedRetry
+		case time.Since(connectedAt) >= syncStableDuration:
+			// 稳定运行过一段时间后断开：从最小间隔重新开始退避
+			unimplementedLogged = false
+			delay = backoff.BaseDelay
+		default:
+			// 建立后很快断开：继续指数退避，不重置
+			delay = nextBackoff(backoff, delay)
+		}
 	}
 }
+
+const (
+	// syncReadyDelay 流建立后多久才视为可用（收到服务端消息会提前视为可用）
+	syncReadyDelay = 5 * time.Second
+	// syncStableDuration 流持续多久算稳定，断开后才重置退避
+	syncStableDuration = time.Minute
+	// syncUnimplementedRetry 面板不支持 Sync 时的重试间隔
+	syncUnimplementedRetry = 10 * time.Minute
+)
 
 const syncHeartbeatInterval = 30 * time.Second
 
