@@ -195,7 +195,13 @@ message SyncResponse {
     Ack ack = 3;
     // 连接建立后面板立即发送，节点据此确认流可用
     ServerHello hello = 4;
+    // 面板定期发送的保活消息：Cloudflare 等代理会断开长时间没有下行数据的流，节点忽略即可
+    Ping ping = 5;
   }
+}
+
+message Ping {
+  int64 sent_at = 1;
 }
 
 message Ack {
