@@ -117,6 +117,7 @@ func buildInbound(nodeInfo *panel.NodeInfo, tag string) (*core.InboundHandlerCon
 					},
 				},
 			}
+			applyQUICALPN(nodeInfo.Type, in.StreamSetting.TLSSettings)
 		}
 	case "reality":
 		if in.StreamSetting == nil {
@@ -340,6 +341,22 @@ func normalizeTransport(value string) string {
 		return "tcp"
 	}
 	return value
+}
+
+// applyQUICALPN 给 Hysteria2 入站固定 ALPN 为 h3。
+// Xray 在未配置 ALPN 时默认 h2/http1.1，Hysteria2 客户端（mihomo、sing-box、官方客户端）
+// 握手时只发 h3，服务端会以 "no application protocol" 拒绝，节点完全无法连接。
+func applyQUICALPN(nodeType string, tlsSettings *coreConf.TLSConfig) {
+	if tlsSettings == nil {
+		return
+	}
+	switch nodeType {
+	case "hysteria2", "hysteria":
+		if tlsSettings.ALPN == nil || len(*tlsSettings.ALPN) == 0 {
+			alpn := coreConf.StringList{"h3"}
+			tlsSettings.ALPN = &alpn
+		}
+	}
 }
 
 func buildHysteria2(nodeInfo *panel.NodeInfo, inbound *coreConf.InboundDetourConfig) error {

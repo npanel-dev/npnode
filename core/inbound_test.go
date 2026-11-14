@@ -5,6 +5,7 @@ import (
 
 	"github.com/npanel-dev/npnode/api/panel"
 	coreConf "github.com/xtls/xray-core/infra/conf"
+	xtls "github.com/xtls/xray-core/transport/internet/tls"
 )
 
 func TestBuildInboundTreatsNoneObfsAsEmpty(t *testing.T) {
@@ -111,4 +112,38 @@ func acceptProxyProtocolEnabled(stream *coreConf.StreamConfig) bool {
 	return stream != nil &&
 		stream.SocketSettings != nil &&
 		stream.SocketSettings.AcceptProxyProtocol
+}
+
+func TestApplyQUICALPNSetsH3ForHysteria(t *testing.T) {
+	for _, nodeType := range []string{"hysteria", "hysteria2"} {
+		tlsSettings := &coreConf.TLSConfig{}
+		applyQUICALPN(nodeType, tlsSettings)
+		built, err := tlsSettings.Build()
+		if err != nil {
+			t.Fatalf("%s: build tls config: %v", nodeType, err)
+		}
+		got := built.(*xtls.Config).NextProtocol
+		if len(got) != 1 || got[0] != "h3" {
+			t.Fatalf("%s: ALPN = %v, want [h3]", nodeType, got)
+		}
+	}
+}
+
+func TestApplyQUICALPNLeavesOtherProtocolsOnDefault(t *testing.T) {
+	for _, nodeType := range []string{"vless", "vmess", "trojan", "anytls"} {
+		tlsSettings := &coreConf.TLSConfig{}
+		applyQUICALPN(nodeType, tlsSettings)
+		if tlsSettings.ALPN != nil {
+			t.Fatalf("%s: ALPN should stay unset, got %v", nodeType, *tlsSettings.ALPN)
+		}
+	}
+}
+
+func TestApplyQUICALPNKeepsExplicitALPN(t *testing.T) {
+	alpn := coreConf.StringList{"custom"}
+	tlsSettings := &coreConf.TLSConfig{ALPN: &alpn}
+	applyQUICALPN("hysteria", tlsSettings)
+	if got := *tlsSettings.ALPN; len(got) != 1 || got[0] != "custom" {
+		t.Fatalf("explicit ALPN overwritten: %v", got)
+	}
 }
