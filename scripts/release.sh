@@ -13,7 +13,7 @@
 # 依赖：go、zip、gh（已登录且对发布仓库有写权限）、git、curl、shasum
 set -euo pipefail
 
-RELEASE_REPO="${RELEASE_REPO:-yunsen1599/NPnode-release}"
+RELEASE_REPO="${RELEASE_REPO:-yunsen1599/Bearnode}"
 GEO_BASE="${GEO_BASE:-https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download}"
 
 version="${1:-}"
@@ -72,11 +72,11 @@ cp README.md "$work/release-repo/README.md"
 )
 
 echo "==> 创建 Release $version"
-gh release create "$version" --repo "$RELEASE_REPO" --title "npnode $version" \
+gh release create "$version" --repo "$RELEASE_REPO" --title "Bearnode $version" \
     --notes "源码提交：$(git rev-parse --short HEAD)" "$work"/dist/*
 
 echo "==> 源码仓库打 tag $version"
-git tag -a "$version" -m "npnode $version"
+git tag -a "$version" -m "Bearnode $version"
 git push -q origin "$version"
 
 echo "完成：https://github.com/$RELEASE_REPO/releases/tag/$version"
