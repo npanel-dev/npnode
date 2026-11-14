@@ -95,11 +95,14 @@ func serverHandle(_ *cobra.Command, _ []string) {
 		if err != nil {
 			log.WithField("err", err).Error("gRPC 连接失败，回退到 HTTP")
 			grpcClient = nil
-		} else {
-			defer grpcClient.Close()
-			grpcClient.StartSync(context.Background(), nil)
 		}
 	}
+	// 重载会替换 gRPC 客户端，退出时关闭当前那个
+	defer func() {
+		if grpcClient != nil {
+			_ = grpcClient.Close()
+		}
+	}()
 
 	var reloadCh = make(chan struct{}, 1)
 	xraycore := core.New(c, p)
@@ -119,6 +122,10 @@ func serverHandle(_ *cobra.Command, _ []string) {
 	if err != nil {
 		log.WithField("err", err).Error("启动节点失败")
 		return
+	}
+	// 入站全部启动后再建立 Sync：面板确认连接后节点会订阅用户推送，推送要能落到已启动的入站上
+	if grpcClient != nil {
+		grpcClient.StartSync(context.Background(), nodes)
 	}
 	log.Infof("已启动 %d 个节点", serverconfig.Data.Total)
 	if watch {
@@ -148,14 +155,14 @@ func serverHandle(_ *cobra.Command, _ []string) {
 			return
 		case <-reloadCh:
 			log.Info("收到重启信号，正在重新加载配置...")
-			if err := reload(config, &nodes, &xraycore); err != nil {
+			if err := reload(config, &nodes, &xraycore, &grpcClient); err != nil {
 				log.WithField("err", err).Error("重启失败")
 			}
 		}
 	}
 }
 
-func reload(config string, nodes **node.Node, xcore **core.XrayCore) error {
+func reload(config string, nodes **node.Node, xcore **core.XrayCore, grpcClient **panel.GrpcClient) error {
 	// Preserve old reload channel so new core continues to receive signals
 	var oldReloadCh chan struct{}
 
@@ -164,6 +171,11 @@ func reload(config string, nodes **node.Node, xcore **core.XrayCore) error {
 	}
 
 	(*nodes).Close()
+	// 关闭旧的 gRPC 客户端：原先每次重载都新建一个而不关旧的，旧的 Sync 循环会一直运行
+	if *grpcClient != nil {
+		_ = (*grpcClient).Close()
+		*grpcClient = nil
+	}
 	if err := (*xcore).Close(); err != nil {
 		return err
 	}
@@ -187,25 +199,33 @@ func reload(config string, nodes **node.Node, xcore **core.XrayCore) error {
 	}
 
 	// Reconnect gRPC if enabled
-	var grpcClient *panel.GrpcClient
+	var newGrpc *panel.GrpcClient
 	if newConf.GrpcConfig.Enable {
-		grpcClient, err = panel.NewGrpcClient(&newConf.GrpcConfig, newConf.ApiConfig.SecretKey, newConf.ApiConfig.ServerId)
+		newGrpc, err = panel.NewGrpcClient(&newConf.GrpcConfig, newConf.ApiConfig.SecretKey, newConf.ApiConfig.ServerId)
 		if err != nil {
 			log.WithField("err", err).Warn("gRPC 重连失败，回退到 HTTP")
-			grpcClient = nil
-		} else {
-			grpcClient.StartSync(context.Background(), nil)
+			newGrpc = nil
 		}
 	}
 
-	newNodes, err := node.New(newCore, newConf, serverconfig, grpcClient)
+	newNodes, err := node.New(newCore, newConf, serverconfig, newGrpc)
 	if err != nil {
+		if newGrpc != nil {
+			_ = newGrpc.Close()
+		}
 		return err
 	}
 	newNodes.InheritTraffic(*nodes)
 	if err := newNodes.Start(); err != nil {
+		if newGrpc != nil {
+			_ = newGrpc.Close()
+		}
 		return err
 	}
+	if newGrpc != nil {
+		newGrpc.StartSync(context.Background(), newNodes)
+	}
+	*grpcClient = newGrpc
 
 	*nodes = newNodes
 	*xcore = newCore

@@ -3,6 +3,8 @@ package node
 import (
 	"context"
 	"fmt"
+	"sync"
+	"time"
 
 	"github.com/npanel-dev/npnode/api/panel"
 	"github.com/npanel-dev/npnode/common/task"
@@ -13,7 +15,13 @@ import (
 
 type Controller struct {
 	// pendingTraffic 已从内核读出、尚未被面板确认的流量
-	pendingTraffic          []pendingTrafficReport
+	pendingTraffic []pendingTrafficReport
+	// userMu 保护 userList / syncVersion / lastFullSync：推送与定时拉取会并发修改
+	userMu sync.Mutex
+	// syncVersion 已应用的推送版本，0 表示推送未就绪（未收到全量或流已断开）
+	syncVersion uint64
+	// lastFullSync 推送模式下最近一次全量（推送全量或拉取校对）的时间
+	lastFullSync            time.Time
 	server                  *vCore.XrayCore
 	apiClient               *panel.ClientV1
 	grpcClient              *panel.GrpcClient

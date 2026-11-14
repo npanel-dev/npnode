@@ -230,8 +230,56 @@ func (g *GrpcClient) StartSync(ctx context.Context, handler SyncHandler) {
 
 // SyncHandler handles incoming messages from the Sync stream.
 type SyncHandler interface {
-	OnUserUpdate(users []UserInfo, action nodev1.UserUpdateAction)
+	// OnUserUpdate 面板推送的某个入站的用户变更（全量或差异）
+	OnUserUpdate(update UserUpdate)
 	OnConfigUpdate(reason string)
+	// SyncInbounds 面板确认连接后要订阅用户推送的入站
+	SyncInbounds() []Inbound
+	// OnSyncDisconnected 流断开：之后的差异不能再接在旧版本上，需等重连后的全量
+	OnSyncDisconnected()
+}
+
+// Inbound 一个入站（协议 + 端口）
+type Inbound struct {
+	Protocol string
+	Port     int
+}
+
+// UserUpdate 面板推送的用户变更。
+// Action 为 FULL 时 Users 是完整列表；为 DIFF 时 Users 是新增/变更后的用户，Removed 是删除/变更前的用户。
+// Version 是该入站用户集合的版本，DIFF 只能应用在“本地版本 + 1”上。
+type UserUpdate struct {
+	Protocol string
+	Port     int
+	Version  uint64
+	Action   nodev1.UserUpdateAction
+	Users    []UserInfo
+	Removed  []UserInfo
+}
+
+func userEntriesToInfo(entries []*nodev1.UserEntry) []UserInfo {
+	users := make([]UserInfo, 0, len(entries))
+	for _, u := range entries {
+		users = append(users, UserInfo{
+			Id:          int(u.Id),
+			Uuid:        u.Uuid,
+			SpeedLimit:  int(u.SpeedLimit),
+			DeviceLimit: int(u.DeviceLimit),
+		})
+	}
+	return users
+}
+
+// Subscribe 订阅入站的用户推送；对已订阅的入站再次订阅会收到当前全量（用于版本断档后重新同步）。
+func (g *GrpcClient) Subscribe(inbounds ...Inbound) error {
+	if len(inbounds) == 0 {
+		return nil
+	}
+	sub := &nodev1.Subscribe{}
+	for _, in := range inbounds {
+		sub.Inbounds = append(sub.Inbounds, &nodev1.Inbound{Protocol: in.Protocol, Port: clampPort(in.Port)})
+	}
+	return g.sendSync(&nodev1.SyncRequest{Payload: &nodev1.SyncRequest_Subscribe{Subscribe: sub}})
 }
 
 // syncAckTimeout 等待面板 Ack 的最长时间
@@ -442,17 +490,16 @@ func (g *GrpcClient) runSyncLoop(handler SyncHandler, done <-chan struct{}) {
 
 			switch payload := resp.Payload.(type) {
 			case *nodev1.SyncResponse_UserUpdate:
-				users := make([]UserInfo, 0, len(payload.UserUpdate.Users))
-				for _, u := range payload.UserUpdate.Users {
-					users = append(users, UserInfo{
-						Id:          int(u.Id),
-						Uuid:        u.Uuid,
-						SpeedLimit:  int(u.SpeedLimit),
-						DeviceLimit: int(u.DeviceLimit),
-					})
-				}
 				if handler != nil {
-					handler.OnUserUpdate(users, payload.UserUpdate.Action)
+					u := payload.UserUpdate
+					handler.OnUserUpdate(UserUpdate{
+						Protocol: u.GetProtocol(),
+						Port:     int(u.GetPort()),
+						Version:  u.GetVersion(),
+						Action:   u.GetAction(),
+						Users:    userEntriesToInfo(u.GetUsers()),
+						Removed:  userEntriesToInfo(u.GetRemoved()),
+					})
 				}
 			case *nodev1.SyncResponse_ConfigUpdate:
 				if handler != nil {
@@ -462,6 +509,11 @@ func (g *GrpcClient) runSyncLoop(handler SyncHandler, done <-chan struct{}) {
 				g.deliverAck(payload.Ack)
 			case *nodev1.SyncResponse_Hello:
 				log.Info("[grpc.Sync] 面板已确认连接，流量改走 gRPC 上报")
+				if handler != nil {
+					if err := g.Subscribe(handler.SyncInbounds()...); err != nil {
+						log.Warnf("[grpc.Sync] 订阅用户推送失败，继续靠定时拉取: %v", err)
+					}
+				}
 			}
 		}
 
@@ -473,6 +525,9 @@ func (g *GrpcClient) runSyncLoop(handler SyncHandler, done <-chan struct{}) {
 		g.sync = nil
 		g.mu.Unlock()
 		g.failAckWaiters()
+		if handler != nil {
+			handler.OnSyncDisconnected()
+		}
 
 		switch {
 		case status.Code(recvErr) == codes.Unimplemented:

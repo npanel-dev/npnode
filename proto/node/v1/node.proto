@@ -148,7 +148,18 @@ message SyncRequest {
     TrafficReport traffic = 1;
     OnlineUserReport online_users = 2;
     StatusReport status = 3;
+    // 订阅入站的用户变更推送；也用于版本断档后重新获取全量
+    Subscribe subscribe = 4;
   }
+}
+
+message Subscribe {
+  repeated Inbound inbounds = 1;
+}
+
+message Inbound {
+  string protocol = 1;
+  uint32 port = 2;
 }
 
 message TrafficReport {
@@ -215,14 +226,23 @@ message ServerHello {
 }
 
 message UserListUpdate {
+  // FULL：完整用户列表；DIFF：新增或变更后的用户
   repeated UserEntry users = 1;
   UserUpdateAction action = 2; // full or incremental
+  // 所属入站
+  string protocol = 3;
+  uint32 port = 4;
+  // 该入站用户集合的版本：DIFF 只能应用在“本地版本 + 1”上，否则节点重新订阅取全量
+  uint64 version = 5;
+  // DIFF：被删除或变更前的用户
+  repeated UserEntry removed = 6;
 }
 
 enum UserUpdateAction {
   USER_UPDATE_FULL = 0;       // Replace entire list
   USER_UPDATE_ADD = 1;        // Add users
   USER_UPDATE_REMOVE = 2;     // Remove users
+  USER_UPDATE_DIFF = 3;       // users 为新增/变更后，removed 为删除/变更前
 }
 
 message ConfigUpdate {

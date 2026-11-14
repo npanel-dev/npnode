@@ -2,13 +2,11 @@ package node
 
 import (
 	"context"
-	"strconv"
 	"time"
 
 	"github.com/npanel-dev/npnode/api/panel"
 	"github.com/npanel-dev/npnode/common/serverstatus"
 	"github.com/npanel-dev/npnode/common/task"
-	vCore "github.com/npanel-dev/npnode/core"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -76,6 +74,15 @@ func (c *Controller) reloadTask() {
 }
 
 func (c *Controller) userListMonitor(ctx context.Context) (err error) {
+	// 推送正常时只做低频全量校对
+	c.userMu.Lock()
+	pushing := c.pushHealthyLocked()
+	recent := time.Since(c.lastFullSync) < pushFullCheckInterval
+	c.userMu.Unlock()
+	if pushing && recent {
+		return nil
+	}
+
 	// get user info — prefer gRPC if available
 	var newU []panel.UserInfo
 	if c.grpcClient != nil {
@@ -113,49 +120,21 @@ func (c *Controller) userListMonitor(ctx context.Context) (err error) {
 	if newA != nil {
 		c.limiter.AliveList = newA
 	}
-	// update user list
-	deleted, added := compareUserList(c.userList, newU)
-	if len(deleted) > 0 {
-		// have deleted users
-		err = c.server.DelUsers(deleted, c.tag, c.info)
-		if err != nil {
-			log.WithFields(log.Fields{
-				"tag": c.tag,
-				"err": err,
-			}).Error("Delete users failed")
-			return nil
-		}
+
+	c.userMu.Lock()
+	defer c.userMu.Unlock()
+	added, deleted, err := c.applyUserSetLocked(newU)
+	if err != nil {
+		log.WithFields(log.Fields{"tag": c.tag, "err": err}).Error("更新用户失败")
+		return nil
 	}
-	if len(added) > 0 {
-		// have added users
-		_, err = c.server.AddUsers(&vCore.AddUsersParams{
-			Tag:      c.tag,
-			NodeInfo: c.info,
-			Users:    added,
-		})
-		if err != nil {
-			log.WithFields(log.Fields{
-				"tag": c.tag,
-				"err": err,
-			}).Error("Add users failed")
-			return nil
+	if pushing {
+		c.lastFullSync = time.Now()
+		if added+deleted != 0 {
+			log.WithField("节点", c.tag).Warnf("全量校对发现推送遗漏：删除 %d 个、新增 %d 个用户，已修正", deleted, added)
 		}
-	}
-	if len(added) > 0 || len(deleted) > 0 {
-		// update Limiter
-		c.limiter.UpdateUser(c.tag, added, deleted)
-		if err != nil {
-			log.WithFields(log.Fields{
-				"tag": c.tag,
-				"err": err,
-			}).Error("limiter users failed")
-			return nil
-		}
-	}
-	c.userList = newU
-	if len(added)+len(deleted) != 0 {
-		log.WithField("节点", c.tag).
-			Infof("删除 %d 个用户，新增 %d 个用户", len(deleted), len(added))
+	} else if added+deleted != 0 {
+		log.WithField("节点", c.tag).Infof("删除 %d 个用户，新增 %d 个用户", deleted, added)
 	}
 	return nil
 }
@@ -279,12 +258,11 @@ func onlineUsersForReport(onlineDevices []panel.OnlineUser, userTraffic []panel.
 func compareUserList(old, new []panel.UserInfo) (deleted, added []panel.UserInfo) {
 	oldMap := make(map[string]int)
 	for i, user := range old {
-		key := user.Uuid + strconv.Itoa(user.SpeedLimit)
-		oldMap[key] = i
+		oldMap[userSyncKey(user)] = i
 	}
 
 	for _, user := range new {
-		key := user.Uuid + strconv.Itoa(user.SpeedLimit)
+		key := userSyncKey(user)
 		if _, exists := oldMap[key]; !exists {
 			added = append(added, user)
 		} else {
