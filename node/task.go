@@ -165,75 +165,99 @@ func (c *Controller) reportUserTrafficTask(ctx context.Context) (err error) {
 	if c.info.TrafficReportThreshold > 0 {
 		reportmin = c.info.TrafficReportThreshold
 	}
+	// 读取即清零：读出来的流量必须最终上报成功，否则就丢了，所以先放进待上报队列
 	userTraffic, _ := c.server.GetUserTrafficSlice(c.tag, reportmin)
-	c.traffic.add(c.apiClient, userTraffic)
-	// Sync.Send has no per-report acknowledgement. Use HTTP for accounted bytes
-	// and retain the batch until the panel confirms it accepted the report.
-	if err := c.traffic.report(ctx); err != nil {
-		log.WithFields(log.Fields{"tag": c.tag, "err": err}).Info("Report user traffic failed; retained for retry")
-	}
+	c.queueTrafficReport(userTraffic)
 
-	// Online users and status can still use the Sync stream.
-	if c.grpcClient != nil && c.grpcClient.IsSyncConnected() {
-		// Report online users via Sync stream
-		if onlineDevice, err := c.limiter.GetOnlineDevice(); err != nil {
-			log.Print(err)
-		} else {
-			result := onlineUsersForReport(*onlineDevice, userTraffic)
-			if err = c.grpcClient.SendOnlineUsers(result); err != nil {
-				log.WithFields(log.Fields{
-					"tag": c.tag,
-					"err": err,
-				}).Info("gRPC Report online users failed")
-			} else {
-				log.WithField("节点", c.tag).Infof("gRPC 已上报 %d 名在线用户", len(result))
-			}
-		}
+	protocol, port := c.info.Type, c.info.Protocol.Port
+	useSync := c.grpcClient != nil && c.grpcClient.IsSyncConnected()
 
-		// Report status via Sync stream
-		CPU, Mem, Disk, _, err := serverstatus.GetSystemInfo()
-		if err != nil {
-			log.Print(err)
-		}
-		if err = c.grpcClient.SendStatus(CPU, Mem, Disk); err != nil {
-			log.WithFields(log.Fields{
-				"tag": c.tag,
-				"err": err,
-			}).Info("gRPC Report status failed")
-		}
+	// 流量：按顺序上报待上报队列，失败的保留到下一轮
+	c.flushPendingTraffic(ctx, useSync)
+
+	// 在线用户
+	if onlineDevice, err := c.limiter.GetOnlineDevice(); err != nil {
+		log.Print(err)
 	} else {
-		if onlineDevice, err := c.limiter.GetOnlineDevice(); err != nil {
-			log.Print(err)
+		result := onlineUsersForReport(*onlineDevice, userTraffic)
+		if useSync {
+			err = c.grpcClient.SendOnlineUsers(protocol, port, result)
 		} else {
-			result := onlineUsersForReport(*onlineDevice, userTraffic)
-			if err = c.apiClient.ReportNodeOnlineUsers(ctx, &result); err != nil {
-				log.WithFields(log.Fields{
-					"tag": c.tag,
-					"err": err,
-				}).Info("Report online users failed")
-			} else {
-				log.WithField("节点", c.tag).Infof("总计 %d 名在线用户, %d 名已上报", len(*onlineDevice), len(result))
-			}
+			err = c.apiClient.ReportNodeOnlineUsers(ctx, &result)
 		}
-
-		CPU, Mem, Disk, Uptime, err := serverstatus.GetSystemInfo()
 		if err != nil {
-			log.Print(err)
-		}
-		err = c.apiClient.ReportNodeStatus(
-			&panel.NodeStatus{
-				CPU:    CPU,
-				Mem:    Mem,
-				Disk:   Disk,
-				Uptime: Uptime,
-			})
-		if err != nil {
-			log.Print(err)
+			log.WithFields(log.Fields{"tag": c.tag, "err": err}).Info("Report online users failed")
+		} else {
+			log.WithField("节点", c.tag).Infof("总计 %d 名在线用户, %d 名已上报", len(*onlineDevice), len(result))
 		}
 	}
 
-	userTraffic = nil
+	// 状态
+	CPU, Mem, Disk, Uptime, err := serverstatus.GetSystemInfo()
+	if err != nil {
+		log.Print(err)
+	}
+	if useSync {
+		err = c.grpcClient.SendStatus(protocol, port, CPU, Mem, Disk)
+	} else {
+		err = c.apiClient.ReportNodeStatus(&panel.NodeStatus{CPU: CPU, Mem: Mem, Disk: Disk, Uptime: Uptime})
+	}
+	if err != nil {
+		log.WithFields(log.Fields{"tag": c.tag, "err": err}).Info("Report status failed")
+	}
 	return nil
+}
+
+// maxPendingTrafficReports 待上报队列上限：面板长时间不可用时丢弃最旧的批次，避免内存无限增长
+const maxPendingTrafficReports = 100
+
+type pendingTrafficReport struct {
+	// reportID 首次经 gRPC 发送时分配，之后重发沿用，面板据此去重
+	reportID string
+	traffic  []panel.UserTraffic
+}
+
+func (c *Controller) queueTrafficReport(traffic []panel.UserTraffic) {
+	if len(traffic) == 0 {
+		return
+	}
+	c.pendingTraffic = append(c.pendingTraffic, pendingTrafficReport{traffic: traffic})
+	if over := len(c.pendingTraffic) - maxPendingTrafficReports; over > 0 {
+		log.WithField("节点", c.tag).Errorf("面板长时间无法接收流量，丢弃最早的 %d 批流量上报", over)
+		c.pendingTraffic = c.pendingTraffic[over:]
+	}
+}
+
+// flushPendingTraffic 按顺序上报待上报队列，遇到失败即停止，剩余的下一轮再试。
+func (c *Controller) flushPendingTraffic(ctx context.Context, useSync bool) {
+	sent := 0
+	for i := range c.pendingTraffic {
+		report := &c.pendingTraffic[i]
+		var err error
+		if useSync {
+			if report.reportID == "" {
+				report.reportID = c.grpcClient.NewTrafficReportID()
+			}
+			err = c.grpcClient.SendTraffic(report.reportID, c.info.Type, c.info.Protocol.Port, report.traffic)
+		} else {
+			err = c.apiClient.ReportUserTraffic(ctx, &report.traffic)
+		}
+		if err != nil {
+			log.WithFields(log.Fields{
+				"tag":     c.tag,
+				"err":     err,
+				"pending": len(c.pendingTraffic) - sent,
+			}).Warn("上报用户流量失败，下一轮重试")
+			break
+		}
+		sent++
+		via := "HTTP"
+		if useSync {
+			via = "gRPC"
+		}
+		log.WithField("节点", c.tag).Infof("已通过%s上报 %d 名用户消耗流量", via, len(report.traffic))
+	}
+	c.pendingTraffic = c.pendingTraffic[sent:]
 }
 
 func onlineUsersForReport(onlineDevices []panel.OnlineUser, userTraffic []panel.UserTraffic) []panel.OnlineUser {

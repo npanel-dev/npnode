@@ -153,6 +153,11 @@ message SyncRequest {
 
 message TrafficReport {
   repeated TrafficEntry traffic = 1;
+  // 入站协议与端口：面板按协议倍率计费
+  string protocol = 2;
+  uint32 port = 3;
+  // 上报唯一 ID：面板去重并回 Ack；节点未收到成功 Ack 时用同一 ID 重发
+  string report_id = 4;
 }
 
 message TrafficEntry {
@@ -163,6 +168,8 @@ message TrafficEntry {
 
 message OnlineUserReport {
   repeated OnlineUserEntry users = 1;
+  string protocol = 2;
+  uint32 port = 3;
 }
 
 message OnlineUserEntry {
@@ -175,13 +182,30 @@ message StatusReport {
   double mem = 2;
   double disk = 3;
   int64 updated_at = 4;
+  // 为空表示心跳（只用于保持连接，面板不覆盖状态）
+  string protocol = 5;
+  uint32 port = 6;
 }
 
 message SyncResponse {
   oneof payload {
     UserListUpdate user_update = 1;
     ConfigUpdate config_update = 2;
+    // 流量上报的处理结果
+    Ack ack = 3;
+    // 连接建立后面板立即发送，节点据此确认流可用
+    ServerHello hello = 4;
   }
+}
+
+message Ack {
+  string report_id = 1;
+  bool ok = 2;
+  string error = 3;
+}
+
+message ServerHello {
+  int64 server_id = 1;
 }
 
 message UserListUpdate {

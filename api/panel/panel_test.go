@@ -138,3 +138,23 @@ func TestGetUserListParsesUsers(t *testing.T) {
 		t.Fatalf("unexpected users: %+v", users)
 	}
 }
+
+// 面板出错时返回 HTTP 200 + {"code":500}：必须当作失败，否则流量被当成已上报而丢失。
+func TestReportUserTrafficTreatsBodyErrorCodeAsFailure(t *testing.T) {
+	for name, tc := range map[string]struct {
+		body    string
+		wantErr bool
+	}{
+		"panel error code": {`{"code":500,"msg":"traffic queue unavailable"}`, true},
+		"success":          {`{"code":200,"msg":"success"}`, false},
+		"empty body":       {``, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			client := newUserListTestClient(t, tc.body)
+			err := client.ReportUserTraffic(context.Background(), &[]UserTraffic{{UID: 1, Upload: 1}})
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("err = %v, wantErr %v", err, tc.wantErr)
+			}
+		})
+	}
+}

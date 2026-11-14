@@ -12,6 +12,8 @@ import (
 )
 
 type Controller struct {
+	// pendingTraffic 已从内核读出、尚未被面板确认的流量
+	pendingTraffic          []pendingTrafficReport
 	server                  *vCore.XrayCore
 	apiClient               *panel.ClientV1
 	grpcClient              *panel.GrpcClient

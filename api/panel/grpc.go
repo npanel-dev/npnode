@@ -2,11 +2,14 @@ package panel
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/npanel-dev/npnode/conf"
@@ -35,6 +38,14 @@ type GrpcClient struct {
 	sync     nodev1.NodeService_SyncClient
 	syncCtx  context.Context
 	syncDone chan struct{}
+
+	// sendMu 串行化 stream.Send
+	sendMu sync.Mutex
+	// ackWaiters 按 report_id 等待面板 Ack
+	ackWaiters map[string]chan *nodev1.Ack
+	// bootID + reportSeq 组成流量上报 ID
+	bootID    string
+	reportSeq atomic.Uint64
 }
 
 // parseGrpcAddr parses a URL-style address into a gRPC target and TLS status.
@@ -113,6 +124,7 @@ func NewGrpcClient(cfg *conf.GrpcConfig, secretKey string, serverID int) (*GrpcC
 		client:    nodev1.NewNodeServiceClient(conn),
 		serverID:  int64(serverID),
 		secretKey: secretKey,
+		bootID:    newBootID(),
 		grpcAddr:  addr,
 	}
 
@@ -222,60 +234,125 @@ type SyncHandler interface {
 	OnConfigUpdate(reason string)
 }
 
-// SendTraffic sends a traffic report via the Sync stream.
-func (g *GrpcClient) SendTraffic(traffic []UserTraffic) error {
-	g.mu.Lock()
-	stream := g.sync
-	g.mu.Unlock()
+// syncAckTimeout 等待面板 Ack 的最长时间
+const syncAckTimeout = 15 * time.Second
 
-	if stream == nil {
-		return fmt.Errorf("sync stream not connected")
-	}
-
-	return stream.Send(&nodev1.SyncRequest{
-		Payload: &nodev1.SyncRequest_Traffic{
-			Traffic: convertTrafficToProto(traffic),
-		},
-	})
+// NewTrafficReportID 生成流量上报 ID：本进程启动标识 + 自增序号。
+// 节点未收到成功 Ack 时用同一个 ID 重发，面板据此去重，不会重复计费。
+func (g *GrpcClient) NewTrafficReportID() string {
+	return fmt.Sprintf("%s:%d", g.bootID, g.reportSeq.Add(1))
 }
 
-// SendOnlineUsers sends an online user report via the Sync stream.
-func (g *GrpcClient) SendOnlineUsers(users []OnlineUser) error {
+// sendSync 串行发送：gRPC 流的 Send 不支持并发调用，多个入站和心跳共用一条流。
+func (g *GrpcClient) sendSync(req *nodev1.SyncRequest) error {
 	g.mu.Lock()
 	stream := g.sync
 	g.mu.Unlock()
-
 	if stream == nil {
 		return fmt.Errorf("sync stream not connected")
 	}
-
-	return stream.Send(&nodev1.SyncRequest{
-		Payload: &nodev1.SyncRequest_OnlineUsers{
-			OnlineUsers: convertOnlineToProto(users),
-		},
-	})
+	g.sendMu.Lock()
+	defer g.sendMu.Unlock()
+	return stream.Send(req)
 }
 
-// SendStatus sends a status report via the Sync stream.
-func (g *GrpcClient) SendStatus(cpu, mem, disk float64) error {
-	g.mu.Lock()
-	stream := g.sync
-	g.mu.Unlock()
-
-	if stream == nil {
-		return fmt.Errorf("sync stream not connected")
+// SendTraffic 经 Sync 上报一批流量并等待面板 Ack。
+// 返回 nil 表示面板已确认处理（含重复上报）；返回错误时调用方应保留这批流量，用同一个 reportID 重发。
+func (g *GrpcClient) SendTraffic(reportID, protocol string, port int, traffic []UserTraffic) error {
+	if reportID == "" {
+		return fmt.Errorf("report id is required")
 	}
+	report := convertTrafficToProto(traffic)
+	report.Protocol = protocol
+	report.Port = clampPort(port)
+	report.ReportId = reportID
 
-	return stream.Send(&nodev1.SyncRequest{
+	waiter := make(chan *nodev1.Ack, 1)
+	g.mu.Lock()
+	if g.ackWaiters == nil {
+		g.ackWaiters = make(map[string]chan *nodev1.Ack)
+	}
+	g.ackWaiters[reportID] = waiter
+	g.mu.Unlock()
+	defer func() {
+		g.mu.Lock()
+		delete(g.ackWaiters, reportID)
+		g.mu.Unlock()
+	}()
+
+	if err := g.sendSync(&nodev1.SyncRequest{Payload: &nodev1.SyncRequest_Traffic{Traffic: report}}); err != nil {
+		return err
+	}
+	timer := time.NewTimer(syncAckTimeout)
+	defer timer.Stop()
+	select {
+	case ack := <-waiter:
+		if ack == nil {
+			return fmt.Errorf("sync stream closed before ack")
+		}
+		if !ack.GetOk() {
+			return fmt.Errorf("panel rejected traffic report %s: %s", reportID, ack.GetError())
+		}
+		return nil
+	case <-timer.C:
+		return fmt.Errorf("timed out waiting for ack of traffic report %s", reportID)
+	}
+}
+
+// deliverAck 把面板 Ack 交给等待中的 SendTraffic
+func (g *GrpcClient) deliverAck(ack *nodev1.Ack) {
+	g.mu.Lock()
+	waiter := g.ackWaiters[ack.GetReportId()]
+	g.mu.Unlock()
+	if waiter != nil {
+		select {
+		case waiter <- ack:
+		default:
+		}
+	}
+}
+
+// failAckWaiters 流断开时让所有等待中的上报立即失败（交给调用方重发），而不是等到超时
+func (g *GrpcClient) failAckWaiters() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for _, waiter := range g.ackWaiters {
+		select {
+		case waiter <- nil:
+		default:
+		}
+	}
+}
+
+// SendOnlineUsers 经 Sync 上报在线用户（快照，面板直接覆盖，无需 Ack）
+func (g *GrpcClient) SendOnlineUsers(protocol string, port int, users []OnlineUser) error {
+	report := convertOnlineToProto(users)
+	report.Protocol = protocol
+	report.Port = clampPort(port)
+	return g.sendSync(&nodev1.SyncRequest{Payload: &nodev1.SyncRequest_OnlineUsers{OnlineUsers: report}})
+}
+
+// SendStatus 经 Sync 上报节点状态。protocol 必填：面板把没有协议的状态当作心跳忽略。
+func (g *GrpcClient) SendStatus(protocol string, port int, cpu, mem, disk float64) error {
+	return g.sendSync(&nodev1.SyncRequest{
 		Payload: &nodev1.SyncRequest_Status{
 			Status: &nodev1.StatusReport{
 				Cpu:       cpu,
 				Mem:       mem,
 				Disk:      disk,
 				UpdatedAt: time.Now().UnixMilli(),
+				Protocol:  protocol,
+				Port:      clampPort(port),
 			},
 		},
 	})
+}
+
+func clampPort(port int) uint32 {
+	if port <= 0 || port > 65535 {
+		return 0
+	}
+	return uint32(port)
 }
 
 // IsSyncConnected returns true if the Sync stream is currently active.
@@ -381,6 +458,10 @@ func (g *GrpcClient) runSyncLoop(handler SyncHandler, done <-chan struct{}) {
 				if handler != nil {
 					handler.OnConfigUpdate(payload.ConfigUpdate.Reason)
 				}
+			case *nodev1.SyncResponse_Ack:
+				g.deliverAck(payload.Ack)
+			case *nodev1.SyncResponse_Hello:
+				log.Info("[grpc.Sync] 面板已确认连接，流量改走 gRPC 上报")
 			}
 		}
 
@@ -391,6 +472,7 @@ func (g *GrpcClient) runSyncLoop(handler SyncHandler, done <-chan struct{}) {
 		streamActive = false
 		g.sync = nil
 		g.mu.Unlock()
+		g.failAckWaiters()
 
 		switch {
 		case status.Code(recvErr) == codes.Unimplemented:
@@ -429,13 +511,16 @@ func (g *GrpcClient) syncHeartbeat(stream nodev1.NodeService_SyncClient, done <-
 		case <-done:
 			return
 		case <-ticker.C:
-			if err := stream.Send(&nodev1.SyncRequest{
+			g.sendMu.Lock()
+			err := stream.Send(&nodev1.SyncRequest{
 				Payload: &nodev1.SyncRequest_Status{
 					Status: &nodev1.StatusReport{
 						UpdatedAt: time.Now().UnixMilli(),
 					},
 				},
-			}); err != nil {
+			})
+			g.sendMu.Unlock()
+			if err != nil {
 				log.Debugf("[grpc.Sync] heartbeat send failed, stream may be closed: %v", err)
 				return
 			}
@@ -483,4 +568,13 @@ func convertOnlineToProto(users []OnlineUser) *nodev1.OnlineUserReport {
 		})
 	}
 	return &nodev1.OnlineUserReport{Users: entries}
+}
+
+// newBootID 每次进程启动生成一个随机标识，与自增序号组成全局唯一的流量上报 ID
+func newBootID() string {
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("t%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b)
 }

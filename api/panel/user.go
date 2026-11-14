@@ -1,6 +1,7 @@
 package panel
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -152,17 +153,31 @@ func (c *ClientV1) ReportUserTraffic(ctx context.Context, userTraffic *[]UserTra
 		body := r.Body()
 		return fmt.Errorf("访问 %s 失败: %s", path.Join(c.APIHost+p), string(body))
 	}
-	if len(r.Body()) > 0 {
-		var result struct {
-			Code int    `json:"code"`
-			Msg  string `json:"msg"`
-		}
-		if err := json.Unmarshal(r.Body(), &result); err != nil {
-			return fmt.Errorf("解码流量上报响应失败: %w", err)
-		}
-		if result.Code != 0 && result.Code != 200 {
-			return fmt.Errorf("流量上报失败: code=%d msg=%s", result.Code, result.Msg)
-		}
+	// 面板出错时仍返回 HTTP 200，错误码放在响应体 code 字段；不检查会把失败当成功，流量丢失
+	if err := checkPanelBodyCode(r.Body()); err != nil {
+		return fmt.Errorf("访问 %s 失败: %w", path.Join(c.APIHost+p), err)
+	}
+
+	return nil
+}
+
+// checkPanelBodyCode 检查面板响应体里的业务状态码：空响应或 code 为 0/200 视为成功。
+func checkPanelBodyCode(body []byte) error {
+	if len(bytes.TrimSpace(body)) == 0 {
+		return nil
+	}
+	var resp struct {
+		Code *int   `json:"code"`
+		Msg  string `json:"msg"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return fmt.Errorf("解码流量上报响应失败: %w", err)
+	}
+	if resp.Code == nil {
+		return nil
+	}
+	if *resp.Code != 0 && *resp.Code != 200 {
+		return fmt.Errorf("面板返回错误 code=%d msg=%s", *resp.Code, resp.Msg)
 	}
 	return nil
 }
