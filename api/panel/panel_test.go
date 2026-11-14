@@ -81,3 +81,60 @@ func TestReportNodeOnlineUsersSendsEmptySnapshot(t *testing.T) {
 		t.Fatalf("request body = %s, want users: []", body)
 	}
 }
+
+func newUserListTestClient(t *testing.T, body string) *ClientV1 {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("ETag", "etag-1")
+		_, _ = io.WriteString(w, body)
+	}))
+	t.Cleanup(server.Close)
+	client, err := NewClientV1(&conf.NodeApiConfig{
+		APIHost:   server.URL,
+		NodeID:    7,
+		SecretKey: "secret",
+		NodeType:  "vless",
+	})
+	if err != nil {
+		t.Fatalf("NewClientV1 returned error: %v", err)
+	}
+	return client
+}
+
+// 空用户列表必须返回非 nil 切片：nil 在调用方表示 HTTP 304 未变化，
+// 返回 nil 会导致用户被全部移除时节点不删除旧用户。
+func TestGetUserListEmptyReturnsNonNilSlice(t *testing.T) {
+	for name, body := range map[string]string{
+		"empty array": `{"users":[]}`,
+		"null":        `{"users":null}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			client := newUserListTestClient(t, body)
+			users, err := client.GetUserList(context.Background())
+			if err != nil {
+				t.Fatalf("GetUserList returned error: %v", err)
+			}
+			if users == nil {
+				t.Fatal("GetUserList returned nil for an empty list; callers treat nil as 304 Not Modified")
+			}
+			if len(users) != 0 {
+				t.Fatalf("len(users) = %d, want 0", len(users))
+			}
+			if client.userEtag != "etag-1" {
+				t.Fatalf("ETag not stored: %q", client.userEtag)
+			}
+		})
+	}
+}
+
+func TestGetUserListParsesUsers(t *testing.T) {
+	client := newUserListTestClient(t, `{"users":[{"id":1,"uuid":"a"},{"id":2,"uuid":"b"}]}`)
+	users, err := client.GetUserList(context.Background())
+	if err != nil {
+		t.Fatalf("GetUserList returned error: %v", err)
+	}
+	if len(users) != 2 || users[0].Id != 1 || users[1].Uuid != "b" {
+		t.Fatalf("unexpected users: %+v", users)
+	}
+}

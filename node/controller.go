@@ -2,7 +2,6 @@ package node
 
 import (
 	"context"
-	"errors"
 	"fmt"
 
 	"github.com/npanel-dev/npnode/api/panel"
@@ -60,7 +59,9 @@ func (c *Controller) Start() error {
 		}
 	}
 	if len(c.userList) == 0 {
-		return errors.New("add users error: not have any user")
+		// 没有有效用户也照常启动：入站和定时任务都要建立，
+		// 之后面板有了用户，userListMonitor 会自动把用户加进来。
+		log.WithField("节点", c.buildNodeTag(c.info)).Warn("当前没有有效用户，节点照常启动，等待面板下发用户")
 	}
 	c.aliveMap, err = c.apiClient.GetUserAlive()
 	if err != nil {

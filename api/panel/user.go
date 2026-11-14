@@ -55,7 +55,9 @@ func (c *ClientV1) GetUserList(ctx context.Context) ([]UserInfo, error) {
 		body := r.Body()
 		return nil, fmt.Errorf("访问 %s 失败: %s", path.Join(c.APIHost+p), string(body))
 	}
-	userlist := &UserListBody{}
+	// 空列表必须是非 nil 切片：调用方用 nil 表示 304 未变化，
+	// 否则用户被全部移除时节点会当作“没变化”而不删除旧用户。
+	userlist := &UserListBody{Users: []UserInfo{}}
 	dec := json.NewDecoder(r.RawResponse.Body)
 	for {
 		tok, err := dec.Token()
@@ -69,6 +71,11 @@ func (c *ClientV1) GetUserList(ctx context.Context) ([]UserInfo, error) {
 	tok, err := dec.Token()
 	if err != nil {
 		return nil, fmt.Errorf("解码用户列表失败: %w", err)
+	}
+	if tok == nil {
+		// "users": null 视为没有用户
+		c.userEtag = r.Header().Get("ETag")
+		return userlist.Users, nil
 	}
 	if tok != json.Delim('[') {
 		return nil, fmt.Errorf(`解码用户列表失败: "users"非数组`)
