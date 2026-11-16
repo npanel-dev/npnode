@@ -137,8 +137,13 @@ func GetServerConfig(ctx context.Context, c *ClientV2) (*ServerConfigResponse, e
 	if err != nil {
 		return nil, fmt.Errorf("解码响应体失败: %s", err)
 	}
+	if resp.Data == nil {
+		return nil, fmt.Errorf("服务端配置为空")
+	}
 	if resp.Data.Protocols == nil {
-		return nil, fmt.Errorf("协议配置为空")
+		// 服务器还没有协议：照常对接，不开入站，之后添加协议会触发重载
+		empty := []Protocol{}
+		resp.Data.Protocols = &empty
 	}
 	return resp, nil
 }

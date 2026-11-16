@@ -62,6 +62,29 @@ func (n *NodeInfo) legacyCertBaseName() string {
 	return n.Type + strconv.Itoa(n.Id)
 }
 
+// ReportServerStatus 按服务器上报状态（不带协议），用于没有任何入站的服务器
+func (c *ClientV2) ReportServerStatus(nodeStatus *NodeStatus) error {
+	p := "/v1/server/status"
+	status := ServerPushStatusRequest{
+		Cpu:       nodeStatus.CPU,
+		Mem:       nodeStatus.Mem,
+		Disk:      nodeStatus.Disk,
+		UpdatedAt: time.Now().UnixMilli(),
+	}
+	r, err := c.Client.R().
+		SetQueryParam("server_id", strconv.Itoa(c.ServerId)).
+		SetBody(status).
+		ForceContentType("application/json").
+		Post(p)
+	if err != nil {
+		return fmt.Errorf("访问 %s 失败: %v", path.Join(c.APIHost+p), err.Error())
+	}
+	if r.StatusCode() >= 400 {
+		return fmt.Errorf("上报服务器状态失败: HTTP %d", r.StatusCode())
+	}
+	return nil
+}
+
 func (c *ClientV1) ReportNodeStatus(nodeStatus *NodeStatus) (err error) {
 	p := "/v1/server/status"
 	status := ServerPushStatusRequest{

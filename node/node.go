@@ -1,11 +1,15 @@
 package node
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	log "github.com/sirupsen/logrus"
+	"time"
 
 	"github.com/npanel-dev/npnode/api/panel"
+	"github.com/npanel-dev/npnode/common/serverstatus"
+	"github.com/npanel-dev/npnode/common/task"
 	"github.com/npanel-dev/npnode/conf"
 	vCore "github.com/npanel-dev/npnode/core"
 )
@@ -14,6 +18,11 @@ type Node struct {
 	controllers []*Controller
 	traffic     *trafficQueue
 	core        *vCore.XrayCore
+	// 没有任何入站时由服务器级任务上报状态，否则面板会一直显示离线
+	statusClient *panel.ClientV2
+	grpcClient   *panel.GrpcClient
+	statusTask   *task.Task
+	pushInterval int
 	// configCheck 合并面板连续推送的配置变更：已有检查在排队时不再重复
 	configCheck chan struct{}
 }
@@ -33,6 +42,9 @@ func New(core *vCore.XrayCore, config *conf.Conf, serverconfig *panel.ServerConf
 	if pullinterval <= 0 {
 		pullinterval = 60
 	}
+	node.statusClient = panel.NewClientV2(&config.ApiConfig)
+	node.grpcClient = grpcClient
+	node.pushInterval = pushinterval
 	for i, nodeconfig := range *serverconfig.Data.Protocols {
 		n := &panel.NodeInfo{
 			Id:                     config.ApiConfig.ServerId,
@@ -77,6 +89,11 @@ func (n *Node) InheritTraffic(old *Node) {
 }
 
 func (n *Node) Start() error {
+	if len(n.controllers) == 0 {
+		n.startServerStatusTask()
+		log.Info("服务器还没有协议，已对接面板，暂不启动入站")
+		return nil
+	}
 	for i := range n.controllers {
 		if !n.controllers[i].info.Protocol.Enable {
 			continue
@@ -100,6 +117,10 @@ func (n *Node) Start() error {
 }
 
 func (n *Node) Close() {
+	if n.statusTask != nil {
+		n.statusTask.Close()
+		n.statusTask = nil
+	}
 	for _, c := range n.controllers {
 		err := c.Close()
 		if err != nil {
@@ -107,4 +128,32 @@ func (n *Node) Close() {
 		}
 	}
 	n.controllers = nil
+}
+
+func (n *Node) startServerStatusTask() {
+	n.statusTask = &task.Task{
+		Name:     "reportServerStatus",
+		Interval: time.Duration(n.pushInterval) * time.Second,
+		Execute:  n.reportServerStatus,
+		ReloadCh: n.core.ReloadCh,
+	}
+	_ = n.statusTask.Start(true)
+}
+
+// reportServerStatus 不带协议上报 CPU/内存/磁盘，让面板知道节点已在线。
+// 失败只记日志，不返回错误，否则任务会停止。
+func (n *Node) reportServerStatus(ctx context.Context) error {
+	cpu, mem, disk, uptime, err := serverstatus.GetSystemInfo()
+	if err != nil {
+		log.WithField("err", err).Warn("读取系统状态失败")
+	}
+	if n.grpcClient != nil && n.grpcClient.IsSyncConnected() {
+		err = n.grpcClient.SendStatus("", 0, cpu, mem, disk)
+	} else {
+		err = n.statusClient.ReportServerStatus(&panel.NodeStatus{CPU: cpu, Mem: mem, Disk: disk, Uptime: uptime})
+	}
+	if err != nil {
+		log.WithField("err", err).Info("Report server status failed")
+	}
+	return nil
 }
