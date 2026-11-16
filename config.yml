@@ -10,7 +10,9 @@ Api:
   Timeout: 30
 
 Grpc:
-  Enable: false
+  # 默认开启：用 gRPC 推送用户和配置变更、上报流量。Addr 留空时从 Api.ApiHost 推出（同一个域名）。
+  # 面板没有开放 gRPC 时节点会自动改用 HTTP；要强制只用 HTTP 改成 false。
+  Enable: true
   Addr:
 
 PprofPort: 0

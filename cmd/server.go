@@ -91,11 +91,7 @@ func serverHandle(_ *cobra.Command, _ []string) {
 	// gRPC client (optional)
 	var grpcClient *panel.GrpcClient
 	if c.GrpcConfig.Enable {
-		grpcClient, err = panel.NewGrpcClient(&c.GrpcConfig, c.ApiConfig.SecretKey, c.ApiConfig.ServerId)
-		if err != nil {
-			log.WithField("err", err).Error("gRPC 连接失败，回退到 HTTP")
-			grpcClient = nil
-		}
+		grpcClient = newCheckedGrpcClient(&c.GrpcConfig, c.ApiConfig.SecretKey, c.ApiConfig.ServerId)
 	}
 	// 重载会替换 gRPC 客户端，退出时关闭当前那个
 	defer func() {
@@ -201,11 +197,7 @@ func reload(config string, nodes **node.Node, xcore **core.XrayCore, grpcClient 
 	// Reconnect gRPC if enabled
 	var newGrpc *panel.GrpcClient
 	if newConf.GrpcConfig.Enable {
-		newGrpc, err = panel.NewGrpcClient(&newConf.GrpcConfig, newConf.ApiConfig.SecretKey, newConf.ApiConfig.ServerId)
-		if err != nil {
-			log.WithField("err", err).Warn("gRPC 重连失败，回退到 HTTP")
-			newGrpc = nil
-		}
+		newGrpc = newCheckedGrpcClient(&newConf.GrpcConfig, newConf.ApiConfig.SecretKey, newConf.ApiConfig.ServerId)
 	}
 
 	newNodes, err := node.New(newCore, newConf, serverconfig, newGrpc)
@@ -232,4 +224,19 @@ func reload(config string, nodes **node.Node, xcore **core.XrayCore, grpcClient 
 	log.Infof("%d 个节点重启成功", serverconfig.Data.Total)
 	runtime.GC()
 	return nil
+}
+
+// newCheckedGrpcClient 建立 gRPC 客户端并确认面板可用；连不上（未转发 gRPC、旧版面板）时返回 nil，节点走 HTTP。
+func newCheckedGrpcClient(cfg *conf.GrpcConfig, secretKey string, serverID int) *panel.GrpcClient {
+	gc, err := panel.NewGrpcClient(cfg, secretKey, serverID)
+	if err != nil {
+		log.WithField("err", err).Warn("gRPC 连接失败，使用 HTTP")
+		return nil
+	}
+	if err := gc.Probe(context.Background()); err != nil {
+		_ = gc.Close()
+		log.WithFields(log.Fields{"addr": cfg.Addr, "err": err}).Warn("面板 gRPC 不可用，使用 HTTP")
+		return nil
+	}
+	return gc
 }

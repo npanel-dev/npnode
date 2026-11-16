@@ -83,18 +83,21 @@ func (c *Controller) userListMonitor(ctx context.Context) (err error) {
 		return nil
 	}
 
-	// get user info — prefer gRPC if available
+	// get user info — prefer gRPC, fall back to HTTP when it fails
 	var newU []panel.UserInfo
+	fetched := false
 	if c.grpcClient != nil {
 		newU, err = c.grpcClient.GetUserList(ctx, c.info.Type, c.info.Protocol.Port)
-		if err != nil {
+		if err == nil {
+			fetched = true
+		} else {
 			log.WithFields(log.Fields{
 				"tag": c.tag,
 				"err": err,
-			}).Error("gRPC Get user list failed")
-			return nil
+			}).Warn("gRPC 获取用户列表失败，改用 HTTP")
 		}
-	} else {
+	}
+	if !fetched {
 		newU, err = c.apiClient.GetUserList(ctx)
 		if err != nil {
 			log.WithFields(log.Fields{

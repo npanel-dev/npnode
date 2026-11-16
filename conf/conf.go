@@ -2,7 +2,9 @@ package conf
 
 import (
 	"fmt"
+	"net/url"
 	"os"
+	"strings"
 
 	"github.com/spf13/viper"
 )
@@ -48,6 +50,8 @@ func New() *Conf {
 			Output: "",
 			Access: "none",
 		},
+		// 默认走 gRPC；配置里没写 Grpc 时也开启，地址从 ApiHost 推出。连不上会自动回退 HTTP。
+		GrpcConfig: GrpcConfig{Enable: true},
 	}
 }
 
@@ -65,5 +69,20 @@ func (p *Conf) LoadFromPath(filePath string) error {
 	if err := v.Unmarshal(p); err != nil {
 		return fmt.Errorf("unmarshal config error: %s", err)
 	}
+	if p.GrpcConfig.Enable && strings.TrimSpace(p.GrpcConfig.Addr) == "" {
+		p.GrpcConfig.Addr = grpcAddrFromAPIHost(p.ApiConfig.ApiHost)
+		if p.GrpcConfig.Addr == "" {
+			p.GrpcConfig.Enable = false
+		}
+	}
 	return nil
+}
+
+// grpcAddrFromAPIHost 面板的 gRPC 和 API 在同一个域名：https://panel.example.com/api → https://panel.example.com
+func grpcAddrFromAPIHost(apiHost string) string {
+	u, err := url.Parse(strings.TrimSpace(apiHost))
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return ""
+	}
+	return u.Scheme + "://" + u.Host
 }

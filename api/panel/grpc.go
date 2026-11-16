@@ -672,3 +672,11 @@ func newBootID() string {
 	}
 	return hex.EncodeToString(b)
 }
+
+// Probe 启动时确认面板的 gRPC 可用（路径被反代转发、面板版本支持）。不可用时调用方改走 HTTP。
+func (g *GrpcClient) Probe(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	_, err := g.GetConfig(ctx, nil)
+	return err
+}

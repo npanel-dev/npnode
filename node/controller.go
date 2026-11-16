@@ -61,12 +61,16 @@ func (c *Controller) SetGrpcClient(gc *panel.GrpcClient) {
 func (c *Controller) Start() error {
 	var err error
 	// Update user — prefer gRPC
+	fetched := false
 	if c.grpcClient != nil {
 		c.userList, err = c.grpcClient.GetUserList(context.Background(), c.info.Type, c.info.Protocol.Port)
-		if err != nil {
-			return fmt.Errorf("gRPC get user list error: %s", err)
+		if err == nil {
+			fetched = true
+		} else {
+			log.WithFields(log.Fields{"tag": c.buildNodeTag(c.info), "err": err}).Warn("gRPC 获取用户列表失败，改用 HTTP")
 		}
-	} else {
+	}
+	if !fetched {
 		c.userList, err = c.apiClient.GetUserList(context.Background())
 		if err != nil {
 			return fmt.Errorf("get user list error: %s", err)
