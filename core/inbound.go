@@ -142,7 +142,9 @@ func buildInbound(nodeInfo *panel.NodeInfo, tag string) (*core.InboundHandlerCon
 			Show:        false,
 			ServerNames: []string{v.SNI},
 			PrivateKey:  v.RealityPrivateKey,
-			ShortIds:    []string{v.RealityShortID},
+			// 不限制客户端版本：上游 Xray 默认只放行 v26.3.27 以上的客户端
+			MinClientVer: "0.0.1",
+			ShortIds:     []string{v.RealityShortID},
 			//Mldsa65Seed: v.RealityMldsa65Seed,
 		}
 	default:
@@ -288,7 +290,12 @@ func buildShadowsocks(nodeInfo *panel.NodeInfo, inbound *coreConf.InboundDetourC
 	settings := &coreConf.ShadowsocksServerConfig{
 		Cipher: cipher,
 	}
-	p := make([]byte, 32)
+	// SS2022 的占位用户密钥必须和加密算法的密钥长度一致（128 位 16 字节，256 位 32 字节）
+	keyLength := 32
+	if cipher == "2022-blake3-aes-128-gcm" {
+		keyLength = 16
+	}
+	p := make([]byte, keyLength)
 	_, err := rand.Read(p)
 	if err != nil {
 		return fmt.Errorf("generate random password error: %s", err)
@@ -298,7 +305,7 @@ func buildShadowsocks(nodeInfo *panel.NodeInfo, inbound *coreConf.InboundDetourC
 	if nodeInfo.Protocol.ServerKey != "" && strings.Contains(cipher, "2022") {
 		nodeInfo.Protocol.ServerKey = base64.StdEncoding.EncodeToString([]byte(nodeInfo.Protocol.ServerKey))
 		settings.Password = nodeInfo.Protocol.ServerKey
-		randomPasswd = base64.StdEncoding.EncodeToString([]byte(randomPasswd))
+		randomPasswd = base64.StdEncoding.EncodeToString(p)
 		cipher = ""
 	}
 	defaultSSuser := &coreConf.ShadowsocksUserConfig{

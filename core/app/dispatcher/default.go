@@ -407,6 +407,7 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 			Reader:  &buf.TimeoutWrapperReader{Reader: outbound.Reader},
 			Counter: &ts.UpCounter,
 		}
+		lm.AddLink(managedWriter, outbound.Reader)
 		outbound.Writer = &dispatcher.SizeStatWriter{
 			Counter: downcounter,
 			Writer:  outbound.Writer,

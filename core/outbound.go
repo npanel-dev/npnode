@@ -1,9 +1,6 @@
 package core
 
 import (
-	"encoding/json"
-	"fmt"
-
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/infra/conf"
 )
@@ -15,15 +12,12 @@ func buildDefaultOutbound() (*core.OutboundHandlerConfig, error) {
 	outboundDetourConfig.Tag = "Default"
 	// The dispatcher selects the source address for each direct connection.
 
-	proxySetting := &conf.FreedomConfig{
-		DomainStrategy: "UseIPv4v6",
+	// 新版 Xray 的 Freedom 域名策略放在 sockopt 里
+	outboundDetourConfig.StreamSetting = &conf.StreamConfig{
+		SocketSettings: &conf.SocketConfig{
+			DomainStrategy: "UseIPv4v6",
+		},
 	}
-	var setting json.RawMessage
-	setting, err := json.Marshal(proxySetting)
-	if err != nil {
-		return nil, fmt.Errorf("marshal proxy config error: %s", err)
-	}
-	outboundDetourConfig.Settings = &setting
 	return outboundDetourConfig.Build()
 }
 
