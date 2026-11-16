@@ -218,7 +218,20 @@ func buildStreamSetting(p *panel.Protocol) (*coreConf.StreamConfig, error) {
 		return nil, fmt.Errorf("unsupported transport type: %s", transport)
 	}
 	applyProxyProtocolSockopt(stream, p.ProxyProtocol)
+	applyTrustedXForwardedFor(stream, p.TrustedXForwardedFor)
 	return stream, nil
+}
+
+// applyTrustedXForwardedFor 套 CDN / 反代时识别用户真实 IP。新版 Xray 默认不信任
+// X-Forwarded-For，只有请求带着这里任一个请求头时才采用（WS/HTTPUpgrade/XHTTP/gRPC 生效）。
+func applyTrustedXForwardedFor(stream *coreConf.StreamConfig, headers []string) {
+	if stream == nil || len(headers) == 0 {
+		return
+	}
+	if stream.SocketSettings == nil {
+		stream.SocketSettings = &coreConf.SocketConfig{}
+	}
+	stream.SocketSettings.TrustedXForwardedFor = headers
 }
 
 func applyProxyProtocolSockopt(stream *coreConf.StreamConfig, enabled bool) {
