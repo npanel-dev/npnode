@@ -57,40 +57,43 @@ type Protocol struct {
 	Transport         string `json:"transport"`
 	ProxyProtocol     bool   `json:"proxy_protocol"`
 	// TrustedXForwardedFor 受信任的请求头名：请求带着其中任一个头时才采用 X-Forwarded-For 里的用户 IP
-	TrustedXForwardedFor    []string `json:"trusted_x_forwarded_for"`
-	Host                    string   `json:"host"`
-	Path                    string   `json:"path"`
-	ServiceName             string   `json:"service_name"`
-	Cipher                  string   `json:"cipher"`
-	ServerKey               string   `json:"server_key"`
-	Flow                    string   `json:"flow"`
-	HopPorts                string   `json:"hop_ports"`
-	HopInterval             int      `json:"hop_interval"`
-	ObfsPassword            string   `json:"obfs_password"`
-	DisableSNI              bool     `json:"disable_sni"`
-	ReduceRTT               bool     `json:"reduce_rtt"`
-	UDPRelayMode            string   `json:"udp_relay_mode"`
-	CongestionController    string   `json:"congestion_controller"`
-	Multiplex               string   `json:"multiplex"`
-	PaddingScheme           string   `json:"padding_scheme"`
-	UpMbps                  int      `json:"up_mbps"`
-	DownMbps                int      `json:"down_mbps"`
-	Obfs                    string   `json:"obfs"`
-	ObfsHost                string   `json:"obfs_host"`
-	ObfsPath                string   `json:"obfs_path"`
-	XHTTPMode               string   `json:"xhttp_mode"`
-	XHTTPExtra              string   `json:"xhttp_extra"`
-	Encryption              string   `json:"encryption"`
-	EncryptionMode          string   `json:"encryption_mode"`
-	EncryptionRTT           string   `json:"encryption_rtt"`
-	EncryptionTicket        string   `json:"encryption_ticket"`
-	EncryptionServerPadding string   `json:"encryption_server_padding"`
-	EncryptionPrivateKey    string   `json:"encryption_private_key"`
-	EncryptionClientPadding string   `json:"encryption_client_padding"`
-	EncryptionPassword      string   `json:"encryption_password"`
-	CertMode                string   `json:"cert_mode"`
-	CertDNSProvider         string   `json:"cert_dns_provider"`
-	CertDNSEnv              string   `json:"cert_dns_env"`
+	TrustedXForwardedFor []string `json:"trusted_x_forwarded_for"`
+	// EchServerKeys ECH 服务端密钥（base64，Xray echServerKeys 格式），由面板生成，只在 TCP 上的 TLS 生效
+	EchEnabled              bool   `json:"ech_enabled"`
+	EchServerKeys           string `json:"ech_server_keys"`
+	Host                    string `json:"host"`
+	Path                    string `json:"path"`
+	ServiceName             string `json:"service_name"`
+	Cipher                  string `json:"cipher"`
+	ServerKey               string `json:"server_key"`
+	Flow                    string `json:"flow"`
+	HopPorts                string `json:"hop_ports"`
+	HopInterval             int    `json:"hop_interval"`
+	ObfsPassword            string `json:"obfs_password"`
+	DisableSNI              bool   `json:"disable_sni"`
+	ReduceRTT               bool   `json:"reduce_rtt"`
+	UDPRelayMode            string `json:"udp_relay_mode"`
+	CongestionController    string `json:"congestion_controller"`
+	Multiplex               string `json:"multiplex"`
+	PaddingScheme           string `json:"padding_scheme"`
+	UpMbps                  int    `json:"up_mbps"`
+	DownMbps                int    `json:"down_mbps"`
+	Obfs                    string `json:"obfs"`
+	ObfsHost                string `json:"obfs_host"`
+	ObfsPath                string `json:"obfs_path"`
+	XHTTPMode               string `json:"xhttp_mode"`
+	XHTTPExtra              string `json:"xhttp_extra"`
+	Encryption              string `json:"encryption"`
+	EncryptionMode          string `json:"encryption_mode"`
+	EncryptionRTT           string `json:"encryption_rtt"`
+	EncryptionTicket        string `json:"encryption_ticket"`
+	EncryptionServerPadding string `json:"encryption_server_padding"`
+	EncryptionPrivateKey    string `json:"encryption_private_key"`
+	EncryptionClientPadding string `json:"encryption_client_padding"`
+	EncryptionPassword      string `json:"encryption_password"`
+	CertMode                string `json:"cert_mode"`
+	CertDNSProvider         string `json:"cert_dns_provider"`
+	CertDNSEnv              string `json:"cert_dns_env"`
 }
 
 func GetServerConfig(ctx context.Context, c *ClientV2) (*ServerConfigResponse, error) {

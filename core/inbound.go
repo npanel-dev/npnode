@@ -118,6 +118,7 @@ func buildInbound(nodeInfo *panel.NodeInfo, tag string) (*core.InboundHandlerCon
 				},
 			}
 			applyQUICALPN(nodeInfo.Type, in.StreamSetting.TLSSettings)
+			applyECH(nodeInfo, in.StreamSetting.TLSSettings)
 		}
 	case "reality":
 		if in.StreamSetting == nil {
@@ -466,4 +467,19 @@ func buildAnyTLS(nodeInfo *panel.NodeInfo, inbound *coreConf.InboundDetourConfig
 		return fmt.Errorf("marshal anytls settings error: %s", err)
 	}
 	return nil
+}
+
+// applyECH 面板开启 ECH 时把服务端密钥交给 Xray（echServerKeys）。只用于 TCP 上的 TLS；
+// 基于 QUIC 的协议（Hysteria2 / TUIC）不处理。
+func applyECH(nodeInfo *panel.NodeInfo, tlsSettings *coreConf.TLSConfig) {
+	if tlsSettings == nil || nodeInfo == nil || nodeInfo.Protocol == nil {
+		return
+	}
+	if !nodeInfo.Protocol.EchEnabled || strings.TrimSpace(nodeInfo.Protocol.EchServerKeys) == "" {
+		return
+	}
+	switch nodeInfo.Type {
+	case "vless", "vmess", "trojan", "anytls":
+		tlsSettings.ECHServerKeys = strings.TrimSpace(nodeInfo.Protocol.EchServerKeys)
+	}
 }
