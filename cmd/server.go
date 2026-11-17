@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"runtime"
 	"syscall"
+	"time"
 
 	"github.com/npanel-dev/npnode/api/panel"
 	"github.com/npanel-dev/npnode/conf"
@@ -143,8 +144,19 @@ func serverHandle(_ *cobra.Command, _ []string) {
 	osSignals := make(chan os.Signal, 1)
 	signal.Notify(osSignals, syscall.SIGINT, syscall.SIGTERM)
 
+	// 回退到 HTTP 后定时检查面板 gRPC，恢复了就重载切回 gRPC
+	grpcRecovery := time.NewTicker(grpcRecoveryInterval)
+	defer grpcRecovery.Stop()
+
 	for {
 		select {
+		case <-grpcRecovery.C:
+			if grpcClient == nil && grpcAvailableAgain(config) {
+				log.Warn("面板 gRPC 已恢复，重载节点切回 gRPC")
+				if err := reload(config, &nodes, &xraycore, &grpcClient); err != nil {
+					log.WithField("err", err).Error("重启失败")
+				}
+			}
 		case <-osSignals:
 			nodes.Close()
 			_ = xraycore.Close()
@@ -239,4 +251,21 @@ func newCheckedGrpcClient(cfg *conf.GrpcConfig, secretKey string, serverID int) 
 		return nil
 	}
 	return gc
+}
+
+// grpcRecoveryInterval 节点因面板 gRPC 不可用改走 HTTP 后，每隔这么久再探测一次
+const grpcRecoveryInterval = 4 * time.Hour
+
+// grpcAvailableAgain 配置仍要求 gRPC 且面板 gRPC 已经可用时返回 true（探测用的连接随即关闭，重载时重新建立）
+func grpcAvailableAgain(config string) bool {
+	c := conf.New()
+	if err := c.LoadFromPath(config); err != nil || !c.GrpcConfig.Enable {
+		return false
+	}
+	gc := newCheckedGrpcClient(&c.GrpcConfig, c.ApiConfig.SecretKey, c.ApiConfig.ServerId)
+	if gc == nil {
+		return false
+	}
+	_ = gc.Close()
+	return true
 }
