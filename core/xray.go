@@ -10,6 +10,7 @@ import (
 	"github.com/npanel-dev/npnode/conf"
 	"github.com/npanel-dev/npnode/core/app/dispatcher"
 	_ "github.com/npanel-dev/npnode/core/distro/all"
+	"github.com/npanel-dev/npnode/upgrade"
 	log "github.com/sirupsen/logrus"
 	"github.com/xtls/xray-core/app/proxyman"
 	"github.com/xtls/xray-core/app/stats"
@@ -170,6 +171,8 @@ func (c *XrayCore) ServerConfigMonitor(ctx context.Context) (err error) {
 		return nil
 	}
 	if newServerConfig != nil {
+		// 配置里带了远程升级请求：先升级（成功时进程被新版本替换），失败则照常重载
+		upgrade.Check(newServerConfig)
 		log.Error("检测到服务端配置变更，正在重启节点...")
 		// Non-blocking signal to avoid goroutine stuck when channel is full or nil
 		if c.ReloadCh != nil {

@@ -7,6 +7,7 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"syscall"
 	"time"
@@ -16,6 +17,7 @@ import (
 	"github.com/npanel-dev/npnode/core"
 	"github.com/npanel-dev/npnode/limiter"
 	"github.com/npanel-dev/npnode/node"
+	"github.com/npanel-dev/npnode/upgrade"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 )
@@ -44,6 +46,7 @@ func init() {
 
 func serverHandle(_ *cobra.Command, _ []string) {
 	showVersion()
+	panel.NodeVersion = version
 	c := conf.New()
 	err := c.LoadFromPath(config)
 	log.SetFormatter(&log.TextFormatter{
@@ -88,6 +91,9 @@ func serverHandle(_ *cobra.Command, _ []string) {
 		log.WithField("err", err).Error("获取服务端配置失败")
 		return
 	}
+	// 启动时也检查远程升级请求（已处理过的请求会跳过）
+	upgrade.StateDir = filepath.Dir(config)
+	upgrade.Check(serverconfig)
 
 	// gRPC client (optional)
 	var grpcClient *panel.GrpcClient

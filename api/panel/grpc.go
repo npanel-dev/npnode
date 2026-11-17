@@ -429,6 +429,7 @@ func (g *GrpcClient) SendStatus(protocol string, port int, cpu, mem, disk float6
 				UpdatedAt: time.Now().UnixMilli(),
 				Protocol:  protocol,
 				Port:      clampPort(port),
+				Version:   NodeVersion,
 			},
 		},
 	})

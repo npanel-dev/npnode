@@ -210,6 +210,8 @@ message StatusReport {
   // 为空表示心跳（只用于保持连接，面板不覆盖状态）
   string protocol = 5;
   uint32 port = 6;
+  // 节点程序版本，面板据此显示
+  string version = 7;
 }
 
 message SyncResponse {

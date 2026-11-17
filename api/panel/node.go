@@ -22,7 +22,11 @@ type ServerPushStatusRequest struct {
 	Mem       float64 `json:"mem"`
 	Disk      float64 `json:"disk"`
 	UpdatedAt int64   `json:"updated_at"`
+	Version   string  `json:"version,omitempty"`
 }
+
+// NodeVersion 节点程序版本，随状态上报给面板（启动时由 cmd 设置）
+var NodeVersion string
 
 type NodeStatus struct {
 	CPU    float64
@@ -70,6 +74,7 @@ func (c *ClientV2) ReportServerStatus(nodeStatus *NodeStatus) error {
 		Mem:       nodeStatus.Mem,
 		Disk:      nodeStatus.Disk,
 		UpdatedAt: time.Now().UnixMilli(),
+		Version:   NodeVersion,
 	}
 	r, err := c.Client.R().
 		SetQueryParam("server_id", strconv.Itoa(c.ServerId)).
@@ -92,6 +97,7 @@ func (c *ClientV1) ReportNodeStatus(nodeStatus *NodeStatus) (err error) {
 		Mem:       nodeStatus.Mem,
 		Disk:      nodeStatus.Disk,
 		UpdatedAt: time.Now().UnixMilli(),
+		Version:   NodeVersion,
 	}
 	if _, err = c.Client.R().SetBody(status).ForceContentType("application/json").Post(p); err != nil {
 		return fmt.Errorf("访问 %s 失败: %v", path.Join(c.APIHost+p), err.Error())

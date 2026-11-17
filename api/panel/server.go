@@ -23,7 +23,9 @@ type Data struct {
 	Block                  *[]string   `json:"block"`
 	Outbound               *[]Outbound `json:"outbound"`
 	Protocols              *[]Protocol `json:"protocols"`
-	Total                  int         `json:"total"`
+	// Upgrade 管理端下发的远程升级请求（只含目标版本，下载地址固定在节点里）
+	Upgrade *UpgradeRequest `json:"upgrade,omitempty"`
+	Total   int             `json:"total"`
 }
 
 type DNSItem struct {
@@ -151,4 +153,10 @@ func GetServerConfig(ctx context.Context, c *ClientV2) (*ServerConfigResponse, e
 		resp.Data.Protocols = &empty
 	}
 	return resp, nil
+}
+
+// UpgradeRequest 远程升级请求：request_id 只处理一次，version 为 latest 或 x.y.z
+type UpgradeRequest struct {
+	RequestID string `json:"request_id"`
+	Version   string `json:"version"`
 }
