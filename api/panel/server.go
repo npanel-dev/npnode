@@ -43,6 +43,8 @@ type Outbound struct {
 	Port     int      `json:"port"`
 	Password string   `json:"password"`
 	Rules    []string `json:"rules"`
+	// Raw 面板生成的完整 Xray 出站配置（出站规则选择已有节点时），有它就忽略上面的地址/端口/密码
+	Raw json.RawMessage `json:"raw,omitempty"`
 }
 
 // ScopedRule 面板规则管理里只应用到部分节点的规则；Inbounds 是这些节点在本服务器上对应的入站

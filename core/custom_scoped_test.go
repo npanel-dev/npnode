@@ -44,3 +44,19 @@ func TestScopedRulesLimitToInbounds(t *testing.T) {
 		t.Fatalf("nil tag func should ignore scoped rules: %v", err)
 	}
 }
+
+func TestRawOutboundFromPanel(t *testing.T) {
+	// 与面板 noderelay.BuildOutbound 生成的格式一致
+	raw := []byte(`{"protocol":"vless","settings":{"vnext":[{"address":"1.2.3.4","port":443,"users":[{"id":"0b6b8a0c-3f1e-4c2a-9d1e-5a7b8c9d0e1f","encryption":"none","flow":"xtls-rprx-vision"}]}]},"streamSettings":{"network":"raw","security":"reality","realitySettings":{"serverName":"www.apple.com","publicKey":"qZLT8bbEtLX0w9TkS9NSz2N0nI0hR1h7l1dM8ZQyVzE","shortId":"ab","fingerprint":"chrome"}}}`)
+	ob, err := buildCustomOutbound(&panel.Outbound{Name: "relay-hk", Raw: raw})
+	if err != nil || ob == nil || ob.Tag != "relay-hk" {
+		t.Fatalf("raw outbound: %v %v", ob, err)
+	}
+	ws := []byte(`{"protocol":"trojan","settings":{"servers":[{"address":"a.com","port":8443,"password":"pw"}]},"streamSettings":{"network":"ws","wsSettings":{"path":"/ws","host":"cdn.a.com"},"security":"tls","tlsSettings":{"serverName":"cdn.a.com","allowInsecure":false}}}`)
+	if _, err := buildCustomOutbound(&panel.Outbound{Name: "t", Raw: ws}); err != nil {
+		t.Fatalf("trojan ws: %v", err)
+	}
+	if _, err := buildCustomOutbound(&panel.Outbound{Name: "bad", Raw: []byte(`{`)}); err == nil {
+		t.Fatal("broken raw should fail")
+	}
+}

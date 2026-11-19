@@ -296,6 +296,15 @@ func GetCustomConfig(serverconfig *panel.ServerConfigResponse, inboundTag func(p
 
 // buildCustomOutbound 面板下发的自定义出站 → Xray 出站；不支持的协议返回 nil
 func buildCustomOutbound(o *panel.Outbound) (*core.OutboundHandlerConfig, error) {
+	if len(o.Raw) > 0 {
+		// 面板按目标节点的协议配置生成的完整出站（TLS / Reality / 传输方式都在里面）
+		var detour coreConf.OutboundDetourConfig
+		if err := json.Unmarshal(o.Raw, &detour); err != nil {
+			return nil, fmt.Errorf("parse raw outbound %s: %w", o.Name, err)
+		}
+		detour.Tag = o.Name
+		return detour.Build()
+	}
 	jsonsettings := map[string]interface{}{
 		"address": o.Address,
 		"port":    o.Port,
