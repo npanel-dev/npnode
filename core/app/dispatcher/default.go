@@ -4,6 +4,7 @@ package dispatcher
 
 import (
 	"context"
+	"github.com/npanel-dev/npnode/common/format"
 	"strings"
 	"sync"
 	"time"
@@ -166,6 +167,7 @@ func (d *DefaultDispatcher) getLink(ctx context.Context, network net.Network) (*
 	var user *protocol.MemoryUser
 	if sessionInbound != nil {
 		user = sessionInbound.User
+		normalizePlainProxyEmail(sessionInbound)
 	}
 
 	var limit *limiter.Limiter
@@ -352,6 +354,7 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 	var user *protocol.MemoryUser
 	if sessionInbound != nil {
 		user = sessionInbound.User
+		normalizePlainProxyEmail(sessionInbound)
 	}
 
 	var limit *limiter.Limiter
@@ -579,4 +582,15 @@ func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.
 	}
 
 	handler.Dispatch(ctx, link)
+}
+
+// normalizePlainProxyEmail SOCKS / HTTP 入站把登录用户名（用户 UUID）当作会话的 email，
+// 其他协议的 email 是“入站标签|UUID”。这里统一成后者，流量统计、限速和在线设备都按同一个键找用户。
+func normalizePlainProxyEmail(in *session.Inbound) {
+	if in == nil || in.User == nil || in.Tag == "" {
+		return
+	}
+	if email := in.User.Email; email != "" && !strings.Contains(email, "|") {
+		in.User.Email = format.UserTag(in.Tag, email)
+	}
 }

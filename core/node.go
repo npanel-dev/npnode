@@ -7,6 +7,11 @@ import (
 )
 
 func (v *XrayCore) AddNode(tag string, info *panel.NodeInfo) error {
+	if isPlainProxy(info.Type) {
+		plainProxies.mu.Lock()
+		defer plainProxies.mu.Unlock()
+		plainProxies.inbounds[tag] = &plainProxyInbound{info: info, users: map[string]bool{}}
+	}
 	inBoundConfig, err := buildInbound(info, tag)
 	if err != nil {
 		return fmt.Errorf("build inbound error: %s", err)
@@ -19,6 +24,9 @@ func (v *XrayCore) AddNode(tag string, info *panel.NodeInfo) error {
 }
 
 func (v *XrayCore) DelNode(tag string) error {
+	plainProxies.mu.Lock()
+	delete(plainProxies.inbounds, tag)
+	plainProxies.mu.Unlock()
 	err := v.removeInbound(tag)
 	if err != nil {
 		return fmt.Errorf("remove in error: %s", err)

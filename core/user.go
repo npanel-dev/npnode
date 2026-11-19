@@ -42,7 +42,10 @@ func (v *XrayCore) GetUserManager(tag string) (proxy.UserManager, error) {
 	return userManager, nil
 }
 
-func (vc *XrayCore) DelUsers(users []panel.UserInfo, tag string, _ *panel.NodeInfo) error {
+func (vc *XrayCore) DelUsers(users []panel.UserInfo, tag string, info *panel.NodeInfo) error {
+	if info != nil && isPlainProxy(info.Type) {
+		return vc.delPlainProxyUsers(users, tag)
+	}
 	userManager, err := vc.GetUserManager(tag)
 	if err != nil {
 		return fmt.Errorf("get user manager error: %s", err)
@@ -108,6 +111,9 @@ func (vc *XrayCore) GetUserTrafficSlice(tag string, mintraffic int) ([]panel.Use
 }
 
 func (v *XrayCore) AddUsers(p *AddUsersParams) (added int, err error) {
+	if p.NodeInfo != nil && isPlainProxy(p.NodeInfo.Type) {
+		return v.addPlainProxyUsers(p)
+	}
 	v.users.mapLock.Lock()
 	defer v.users.mapLock.Unlock()
 	for i := range p.Users {

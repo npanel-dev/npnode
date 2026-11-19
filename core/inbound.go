@@ -44,9 +44,16 @@ func (v *XrayCore) addInbound(config *core.InboundHandlerConfig) error {
 
 // BuildInbound build Inbound config for different protocol
 func buildInbound(nodeInfo *panel.NodeInfo, tag string) (*core.InboundHandlerConfig, error) {
+	return buildInboundWithUsers(nodeInfo, tag, nil)
+}
+
+// buildInboundWithUsers plainUsers 只对 SOCKS / HTTP 有用：它们的账号写在入站设置里
+func buildInboundWithUsers(nodeInfo *panel.NodeInfo, tag string, plainUsers []string) (*core.InboundHandlerConfig, error) {
 	in := &coreConf.InboundDetourConfig{}
 	var err error
 	switch nodeInfo.Type {
+	case "socks", "http":
+		err = buildPlainProxy(nodeInfo, in, plainUsers)
 	case "vless":
 		err = buildVLess(nodeInfo, in)
 	case "vmess":
