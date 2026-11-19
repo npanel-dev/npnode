@@ -153,8 +153,5 @@ func (c *Controller) buildNodeTag(node *panel.NodeInfo) string {
 	if node.Protocol != nil {
 		port = node.Protocol.Port
 	}
-	if port > 0 {
-		return fmt.Sprintf("[%s]-%s:%d:%d", c.apiClient.APIHost, node.Type, node.Id, port)
-	}
-	return fmt.Sprintf("[%s]-%s:%d", c.apiClient.APIHost, node.Type, node.Id)
+	return vCore.InboundTag(c.apiClient.APIHost, node.Id, node.Type, port)
 }

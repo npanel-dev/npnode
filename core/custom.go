@@ -2,6 +2,7 @@ package core
 
 import (
 	"encoding/json"
+	"fmt"
 	"net"
 	"strings"
 
@@ -42,7 +43,40 @@ func hasOutboundWithTag(list []*core.OutboundHandlerConfig, tag string) bool {
 	return false
 }
 
-func GetCustomConfig(serverconfig *panel.ServerConfigResponse) (*dns.Config, []*core.OutboundHandlerConfig, *router.Config, error) {
+// InboundTag 入站标签。节点控制器和按入站限定的路由规则都用它，两边必须一致。
+func InboundTag(apiHost string, serverID int, protocolType string, port int) string {
+	if port > 0 {
+		return fmt.Sprintf("[%s]-%s:%d:%d", apiHost, protocolType, serverID, port)
+	}
+	return fmt.Sprintf("[%s]-%s:%d", apiHost, protocolType, serverID)
+}
+
+// parseDomainRules 面板的域名规则写法 → Xray 的 domain 匹配写法
+func parseDomainRules(items []string) []string {
+	var domains []string
+	for _, item := range items {
+		data := strings.SplitN(item, ":", 2)
+		if len(data) == 2 {
+			switch data[0] {
+			case "keyword":
+				domains = append(domains, data[1])
+			case "suffix":
+				domains = append(domains, "domain:"+data[1])
+			case "regex":
+				domains = append(domains, "regexp:"+data[1])
+			default:
+				domains = append(domains, data[1])
+			}
+		} else {
+			domains = append(domains, "full:"+item)
+		}
+	}
+	return domains
+}
+
+// GetCustomConfig 构建 DNS、出站和路由。inboundTag 把面板下发的入站（协议+端口）换成本机的入站标签，
+// 用于只对部分入站生效的规则；为 nil 时忽略这类规则。
+func GetCustomConfig(serverconfig *panel.ServerConfigResponse, inboundTag func(protocolType string, port int) string) (*dns.Config, []*core.OutboundHandlerConfig, *router.Config, error) {
 	var ip_strategy string
 	if serverconfig.Data.IPStrategy != "" {
 		switch serverconfig.Data.IPStrategy {
@@ -174,93 +208,68 @@ func GetCustomConfig(serverconfig *panel.ServerConfigResponse) (*dns.Config, []*
 		}
 	}
 
-	//custom outbound
-	if outboundList != nil {
-		for _, outbounditem := range *outboundList {
-			jsonsettings := map[string]interface{}{
-				"address": outbounditem.Address,
-				"port":    outbounditem.Port,
+	//scoped rules: 只对部分入站生效（屏蔽在前，出站在后，都排在全局出站规则之前）
+	var scopedOutbounds []*panel.ScopedRule
+	if serverconfig.Data.ScopedRules != nil && inboundTag != nil {
+		for i := range *serverconfig.Data.ScopedRules {
+			sr := &(*serverconfig.Data.ScopedRules)[i]
+			var tags []string
+			for _, in := range sr.Inbounds {
+				tags = append(tags, inboundTag(in.Type, in.Port))
 			}
-			streamSettings := &coreConf.StreamConfig{}
-			switch outbounditem.Protocol {
-			case "http":
-				//jsonsettings["user"] = outbounditem.User
-				jsonsettings["pass"] = outbounditem.Password
-			case "socks":
-				//jsonsettings["user"] = outbounditem.User
-				jsonsettings["pass"] = outbounditem.Password
-			case "shadowsocks":
-				//jsonsettings["method"] = outbounditem.Method
-				jsonsettings["password"] = outbounditem.Password
-				jsonsettings["uot"] = true
-				jsonsettings["UoTVersion"] = 2
-			case "trojan":
-				jsonsettings["password"] = outbounditem.Password
-				proto := coreConf.TransportProtocol("tcp")
-				streamSettings.Network = &proto
-				streamSettings.Security = "tls"
-				streamSettings.TLSSettings = &coreConf.TLSConfig{
-					//ServerName: outbounditem.SNI,
-					//Insecure: outbounditem.Insecure,
-				}
-			case "vmess":
-				jsonsettings["uuid"] = outbounditem.Password
-				proto := coreConf.TransportProtocol("tcp")
-				streamSettings.Network = &proto
-				/*if outbounditem.Security != "" && outbounditem.Security == "tls" {
-					streamSettings.Security = "tls"
-					streamSettings.TLSSettings = &coreConf.TLSConfig{
-						ServerName: outbounditem.SNI,
-						Insecure: outbounditem.Insecure,
-				}*/
-			case "vless":
-				jsonsettings["uuid"] = outbounditem.Password
-				proto := coreConf.TransportProtocol("tcp")
-				streamSettings.Network = &proto
-				/*if outbounditem.Security != "" && outbounditem.Security == "tls" {
-					streamSettings.Security = "tls"
-					streamSettings.TLSSettings = &coreConf.TLSConfig{
-						ServerName: outbounditem.SNI,
-						Insecure: outbounditem.Insecure,
-				}*/
-			//case "wireguard":
-			default:
+			domains := parseDomainRules(sr.Domains)
+			if len(tags) == 0 || len(domains) == 0 {
 				continue
 			}
-
-			settings, _ := json.Marshal(jsonsettings)
-			rawSettings := json.RawMessage(settings)
-			outbound := &coreConf.OutboundDetourConfig{
-				Tag:           outbounditem.Name,
-				Protocol:      outbounditem.Protocol,
-				Settings:      &rawSettings,
-				StreamSetting: streamSettings,
-			}
-			// Outbound rules
-			var domains []string
-			for _, item := range outbounditem.Rules {
-				data := strings.Split(item, ":")
-				if len(data) == 2 {
-					switch data[0] {
-					case "keyword":
-						domains = append(domains, data[1])
-					case "suffix":
-						domains = append(domains, "domain:"+data[1])
-					case "regex":
-						domains = append(domains, "regexp:"+data[1])
-					default:
-						domains = append(domains, data[1])
-					}
-				} else {
-					domains = append(domains, "full:"+item)
+			switch sr.Type {
+			case "block":
+				rawRule, err := json.Marshal(map[string]interface{}{
+					"inboundTag":  tags,
+					"domain":      domains,
+					"outboundTag": "block",
+				})
+				if err == nil {
+					coreRouterConfig.RuleList = append(coreRouterConfig.RuleList, rawRule)
+				}
+			case "outbound":
+				if sr.Outbound != nil {
+					scopedOutbounds = append(scopedOutbounds, sr)
 				}
 			}
-			custom_outbound, err := outbound.Build()
-			if err != nil {
+		}
+	}
+	for _, sr := range scopedOutbounds {
+		custom, err := buildCustomOutbound(sr.Outbound)
+		if err != nil || custom == nil {
+			continue
+		}
+		var tags []string
+		for _, in := range sr.Inbounds {
+			tags = append(tags, inboundTag(in.Type, in.Port))
+		}
+		rawRule, err := json.Marshal(map[string]interface{}{
+			"inboundTag":  tags,
+			"domain":      parseDomainRules(sr.Domains),
+			"outboundTag": custom.Tag,
+		})
+		if err == nil {
+			coreRouterConfig.RuleList = append(coreRouterConfig.RuleList, rawRule)
+		}
+		if !hasOutboundWithTag(coreOutboundConfig, custom.Tag) {
+			coreOutboundConfig = append(coreOutboundConfig, custom)
+		}
+	}
+
+	//custom outbound
+	if outboundList != nil {
+		for i := range *outboundList {
+			outbounditem := &(*outboundList)[i]
+			custom_outbound, err := buildCustomOutbound(outbounditem)
+			if err != nil || custom_outbound == nil {
 				continue
 			}
 			rule := map[string]interface{}{
-				"domain":      domains,
+				"domain":      parseDomainRules(outbounditem.Rules),
 				"outboundTag": custom_outbound.Tag,
 			}
 			rawRule, err := json.Marshal(rule)
@@ -283,4 +292,68 @@ func GetCustomConfig(serverconfig *panel.ServerConfigResponse) (*dns.Config, []*
 		return nil, nil, nil, err
 	}
 	return DnsConfig, coreOutboundConfig, RouterConfig, nil
+}
+
+// buildCustomOutbound 面板下发的自定义出站 → Xray 出站；不支持的协议返回 nil
+func buildCustomOutbound(o *panel.Outbound) (*core.OutboundHandlerConfig, error) {
+	jsonsettings := map[string]interface{}{
+		"address": o.Address,
+		"port":    o.Port,
+	}
+	streamSettings := &coreConf.StreamConfig{}
+	switch o.Protocol {
+	case "http":
+		//jsonsettings["user"] = o.User
+		jsonsettings["pass"] = o.Password
+	case "socks":
+		//jsonsettings["user"] = o.User
+		jsonsettings["pass"] = o.Password
+	case "shadowsocks":
+		//jsonsettings["method"] = o.Method
+		jsonsettings["password"] = o.Password
+		jsonsettings["uot"] = true
+		jsonsettings["UoTVersion"] = 2
+	case "trojan":
+		jsonsettings["password"] = o.Password
+		proto := coreConf.TransportProtocol("tcp")
+		streamSettings.Network = &proto
+		streamSettings.Security = "tls"
+		streamSettings.TLSSettings = &coreConf.TLSConfig{
+			//ServerName: o.SNI,
+			//Insecure: o.Insecure,
+		}
+	case "vmess":
+		jsonsettings["uuid"] = o.Password
+		proto := coreConf.TransportProtocol("tcp")
+		streamSettings.Network = &proto
+		/*if o.Security != "" && o.Security == "tls" {
+			streamSettings.Security = "tls"
+			streamSettings.TLSSettings = &coreConf.TLSConfig{
+				ServerName: o.SNI,
+				Insecure: o.Insecure,
+		}*/
+	case "vless":
+		jsonsettings["uuid"] = o.Password
+		proto := coreConf.TransportProtocol("tcp")
+		streamSettings.Network = &proto
+		/*if o.Security != "" && o.Security == "tls" {
+			streamSettings.Security = "tls"
+			streamSettings.TLSSettings = &coreConf.TLSConfig{
+				ServerName: o.SNI,
+				Insecure: o.Insecure,
+		}*/
+	//case "wireguard":
+	default:
+		return nil, nil
+	}
+
+	settings, _ := json.Marshal(jsonsettings)
+	rawSettings := json.RawMessage(settings)
+	outbound := &coreConf.OutboundDetourConfig{
+		Tag:           o.Name,
+		Protocol:      o.Protocol,
+		Settings:      &rawSettings,
+		StreamSetting: streamSettings,
+	}
+	return outbound.Build()
 }

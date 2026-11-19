@@ -22,7 +22,9 @@ type Data struct {
 	DNS                    *[]DNSItem  `json:"dns"`
 	Block                  *[]string   `json:"block"`
 	Outbound               *[]Outbound `json:"outbound"`
-	Protocols              *[]Protocol `json:"protocols"`
+	// ScopedRules 只对部分入站（面板里的部分节点）生效的屏蔽 / 出站规则
+	ScopedRules *[]ScopedRule `json:"scoped_rules,omitempty"`
+	Protocols   *[]Protocol   `json:"protocols"`
 	// Upgrade 管理端下发的远程升级请求（只含目标版本，下载地址固定在节点里）
 	Upgrade *UpgradeRequest `json:"upgrade,omitempty"`
 	Total   int             `json:"total"`
@@ -41,6 +43,19 @@ type Outbound struct {
 	Port     int      `json:"port"`
 	Password string   `json:"password"`
 	Rules    []string `json:"rules"`
+}
+
+// ScopedRule 面板规则管理里只应用到部分节点的规则；Inbounds 是这些节点在本服务器上对应的入站
+type ScopedRule struct {
+	Type     string          `json:"type"` // block / outbound
+	Inbounds []ScopedInbound `json:"inbounds"`
+	Domains  []string        `json:"domains"`
+	Outbound *Outbound       `json:"outbound,omitempty"`
+}
+
+type ScopedInbound struct {
+	Type string `json:"type"`
+	Port int    `json:"port"`
 }
 
 type Protocol struct {

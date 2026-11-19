@@ -99,7 +99,9 @@ func getCore(c *conf.Conf, serverconfig *panel.ServerConfigResponse) *core.Insta
 		ErrorLog:  c.LogConfig.Output,
 	}
 	// Custom config
-	dnsConfig, outBoundConfig, routeConfig, err := GetCustomConfig(serverconfig)
+	dnsConfig, outBoundConfig, routeConfig, err := GetCustomConfig(serverconfig, func(protocolType string, port int) string {
+		return InboundTag(c.ApiConfig.ApiHost, c.ApiConfig.ServerId, protocolType, port)
+	})
 	if err != nil {
 		log.WithField("err", err).Panic("failed to build custom config")
 	}
