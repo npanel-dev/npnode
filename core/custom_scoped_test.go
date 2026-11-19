@@ -60,3 +60,61 @@ func TestRawOutboundFromPanel(t *testing.T) {
 		t.Fatal("broken raw should fail")
 	}
 }
+
+func TestSplitRuleItems(t *testing.T) {
+	got := splitRuleItems([]string{
+		"example.com", "suffix:a.com", "keyword:ads", "regex:^x\\.", "geosite:netflix",
+		"1.2.3.4", "10.0.0.0/8", "2001:db8::/32", "geoip:private", "ip:8.8.8.8",
+		"protocol:BitTorrent", " ",
+	})
+	wantDomains := []string{"full:example.com", "domain:a.com", "ads", "regexp:^x\\.", "geosite:netflix"}
+	wantIPs := []string{"1.2.3.4", "10.0.0.0/8", "2001:db8::/32", "geoip:private", "8.8.8.8"}
+	if len(got.domains) != len(wantDomains) || len(got.ips) != len(wantIPs) || len(got.protocols) != 1 || got.protocols[0] != "bittorrent" {
+		t.Fatalf("got %+v", got)
+	}
+	for i := range wantDomains {
+		if got.domains[i] != wantDomains[i] {
+			t.Fatalf("domain %d = %s", i, got.domains[i])
+		}
+	}
+	for i := range wantIPs {
+		if got.ips[i] != wantIPs[i] {
+			t.Fatalf("ip %d = %s", i, got.ips[i])
+		}
+	}
+}
+
+func TestBlockIPAndProtocolRules(t *testing.T) {
+	cfg := &panel.ServerConfigResponse{Data: &panel.Data{
+		Block: &[]string{"suffix:ads.com", "10.0.0.0/8", "protocol:bittorrent"},
+		DNS:   &[]panel.DNSItem{{Address: "8.8.8.8:5353", Domains: []string{"suffix:google.com"}}, {Address: "https://1.1.1.1/dns-query"}},
+	}}
+	dnsCfg, _, router, err := GetCustomConfig(cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var hasDomain, hasIP, hasProto bool
+	for _, r := range router.Rule {
+		if r.GetTag() != "block" {
+			continue
+		}
+		hasDomain = hasDomain || len(r.GetDomain()) > 0
+		hasIP = hasIP || len(r.GetIp()) > 0
+		hasProto = hasProto || len(r.GetProtocol()) > 0
+	}
+	if !hasDomain || !hasIP || !hasProto {
+		t.Fatalf("block rules: domain=%v ip=%v protocol=%v", hasDomain, hasIP, hasProto)
+	}
+	var udpPort uint32
+	for _, ns := range dnsCfg.NameServer {
+		if ns.GetAddress().GetPort() == 5353 {
+			udpPort = ns.GetAddress().GetPort()
+		}
+	}
+	if udpPort != 5353 {
+		t.Fatalf("dns port not split from host:port")
+	}
+	if a, p := dnsServerAddress("tcp://8.8.8.8:53"); a != "tcp://8.8.8.8:53" || p != 0 {
+		t.Fatalf("url address changed: %s %d", a, p)
+	}
+}

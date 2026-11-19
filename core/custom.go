@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 
 	"github.com/npanel-dev/npnode/api/panel"
@@ -51,27 +52,106 @@ func InboundTag(apiHost string, serverID int, protocolType string, port int) str
 	return fmt.Sprintf("[%s]-%s:%d", apiHost, protocolType, serverID)
 }
 
-// parseDomainRules 面板的域名规则写法 → Xray 的 domain 匹配写法
+// parseDomainRules 面板的域名规则写法 → Xray 的 domain 匹配写法（只保留域名类，IP / 协议条目忽略）
 func parseDomainRules(items []string) []string {
-	var domains []string
-	for _, item := range items {
-		data := strings.SplitN(item, ":", 2)
-		if len(data) == 2 {
-			switch data[0] {
+	return splitRuleItems(items).domains
+}
+
+type ruleItems struct {
+	domains   []string
+	ips       []string
+	protocols []string
+}
+
+// splitRuleItems 把面板的规则条目分成域名、IP、协议三类：
+//   - 域名：example.com（精确）、suffix:、keyword:、regex:、full:、domain:、geosite:
+//   - IP：1.2.3.4、1.2.3.0/24、IPv6、ip:...、geoip:cn / geoip:private
+//   - 协议：protocol:bittorrent（以及 http / tls / quic）
+func splitRuleItems(items []string) ruleItems {
+	var out ruleItems
+	for _, raw := range items {
+		item := strings.TrimSpace(raw)
+		if item == "" {
+			continue
+		}
+		prefix, value, hasPrefix := strings.Cut(item, ":")
+		if hasPrefix {
+			switch strings.ToLower(prefix) {
 			case "keyword":
-				domains = append(domains, data[1])
-			case "suffix":
-				domains = append(domains, "domain:"+data[1])
-			case "regex":
-				domains = append(domains, "regexp:"+data[1])
-			default:
-				domains = append(domains, data[1])
+				out.domains = append(out.domains, value)
+				continue
+			case "suffix", "domain":
+				out.domains = append(out.domains, "domain:"+value)
+				continue
+			case "regex", "regexp":
+				out.domains = append(out.domains, "regexp:"+value)
+				continue
+			case "full":
+				out.domains = append(out.domains, "full:"+value)
+				continue
+			case "geosite":
+				out.domains = append(out.domains, "geosite:"+value)
+				continue
+			case "geoip":
+				out.ips = append(out.ips, "geoip:"+value)
+				continue
+			case "ip", "cidr":
+				out.ips = append(out.ips, value)
+				continue
+			case "protocol":
+				out.protocols = append(out.protocols, strings.ToLower(value))
+				continue
 			}
-		} else {
-			domains = append(domains, "full:"+item)
+		}
+		// 不带前缀：IP / CIDR 按 IP 处理（IPv6 自带冒号，所以先判断），否则按精确域名
+		if _, _, err := net.ParseCIDR(item); err == nil {
+			out.ips = append(out.ips, item)
+			continue
+		}
+		if net.ParseIP(item) != nil {
+			out.ips = append(out.ips, item)
+			continue
+		}
+		out.domains = append(out.domains, "full:"+item)
+	}
+	return out
+}
+
+// routeRules 一组条目 → 指向 outboundTag 的路由规则（域名 / IP / 协议各一条：同一条规则里的条件是“且”）
+func routeRules(items []string, outboundTag string, inboundTags []string) []json.RawMessage {
+	parts := splitRuleItems(items)
+	var rules []json.RawMessage
+	add := func(field string, values []string) {
+		if len(values) == 0 {
+			return
+		}
+		rule := map[string]interface{}{field: values, "outboundTag": outboundTag}
+		if len(inboundTags) > 0 {
+			rule["inboundTag"] = inboundTags
+		}
+		if raw, err := json.Marshal(rule); err == nil {
+			rules = append(rules, raw)
 		}
 	}
-	return domains
+	add("domain", parts.domains)
+	add("ip", parts.ips)
+	add("protocol", parts.protocols)
+	return rules
+}
+
+// dnsServerAddress 面板的 DNS 地址 → Xray 地址和端口。
+// 带协议前缀（https:// tcp:// quic+local:// 等）原样交给 Xray；普通 host:port 拆出端口（不拆会被当成域名）。
+func dnsServerAddress(address string) (string, uint16) {
+	address = strings.TrimSpace(address)
+	if strings.Contains(address, "://") {
+		return address, 0
+	}
+	if host, port, err := net.SplitHostPort(address); err == nil {
+		if p, err := strconv.Atoi(port); err == nil && p > 0 && p < 65536 {
+			return host, uint16(p)
+		}
+	}
+	return address, 0
 }
 
 // GetCustomConfig 构建 DNS、出站和路由。inboundTag 把面板下发的入站（协议+端口）换成本机的入站标签，
@@ -117,42 +197,14 @@ func GetCustomConfig(serverconfig *panel.ServerConfigResponse, inboundTag func(p
 	//custom dns
 	if dnsConfig != nil {
 		for _, item := range *dnsConfig {
-			var domains []string
-			for _, domainitem := range item.Domains {
-				data := strings.Split(domainitem, ":")
-				if len(data) == 2 {
-					switch data[0] {
-					case "keyword":
-						domains = append(domains, data[1])
-					case "suffix":
-						domains = append(domains, "domain:"+data[1])
-					case "regex":
-						domains = append(domains, "regexp:"+data[1])
-					default:
-						domains = append(domains, data[1])
-					}
-				} else {
-					domains = append(domains, "full:"+domainitem)
-				}
-			}
-			/*switch item.Proto {
-			case "udp":
-				item.Address = item.Address
-			case "tcp":
-				item.Address = "tcp://" + item.Address
-			case "tls":
-				item.Address = "tls://" + item.Address
-			case "https":
-				item.Address = "https://" + item.Address
-			case "quic":
-				item.Address = "quic://" + item.Address
-			}*/
+			address, port := dnsServerAddress(item.Address)
 			server := &coreConf.NameServerConfig{
 				Address: &coreConf.Address{
-					Address: xnet.ParseAddress(item.Address),
+					Address: xnet.ParseAddress(address),
 				},
+				Port:          port,
 				QueryStrategy: ip_strategy,
-				Domains:       domains,
+				Domains:       parseDomainRules(item.Domains),
 			}
 			coreDnsConfig.Servers = append(coreDnsConfig.Servers, server)
 		}
@@ -178,34 +230,9 @@ func GetCustomConfig(serverconfig *panel.ServerConfigResponse, inboundTag func(p
 		DomainStrategy: &domainStrategy,
 	}
 
-	//custom block
+	//custom block：域名 / IP / 协议都可以
 	if blockList != nil {
-		var domains []string
-		for _, bitem := range *blockList {
-			data := strings.Split(bitem, ":")
-			if len(data) == 2 {
-				switch data[0] {
-				case "keyword":
-					domains = append(domains, data[1])
-				case "suffix":
-					domains = append(domains, "domain:"+data[1])
-				case "regex":
-					domains = append(domains, "regexp:"+data[1])
-				default:
-					domains = append(domains, data[1])
-				}
-			} else {
-				domains = append(domains, "full:"+bitem)
-			}
-		}
-		rule := map[string]interface{}{
-			"domain":      domains,
-			"outboundTag": "block",
-		}
-		rawRule, err := json.Marshal(rule)
-		if err == nil {
-			coreRouterConfig.RuleList = append(coreRouterConfig.RuleList, rawRule)
-		}
+		coreRouterConfig.RuleList = append(coreRouterConfig.RuleList, routeRules(*blockList, "block", nil)...)
 	}
 
 	//scoped rules: 只对部分入站生效（屏蔽在前，出站在后，都排在全局出站规则之前）
@@ -217,20 +244,12 @@ func GetCustomConfig(serverconfig *panel.ServerConfigResponse, inboundTag func(p
 			for _, in := range sr.Inbounds {
 				tags = append(tags, inboundTag(in.Type, in.Port))
 			}
-			domains := parseDomainRules(sr.Domains)
-			if len(tags) == 0 || len(domains) == 0 {
+			if len(tags) == 0 || len(sr.Domains) == 0 {
 				continue
 			}
 			switch sr.Type {
 			case "block":
-				rawRule, err := json.Marshal(map[string]interface{}{
-					"inboundTag":  tags,
-					"domain":      domains,
-					"outboundTag": "block",
-				})
-				if err == nil {
-					coreRouterConfig.RuleList = append(coreRouterConfig.RuleList, rawRule)
-				}
+				coreRouterConfig.RuleList = append(coreRouterConfig.RuleList, routeRules(sr.Domains, "block", tags)...)
 			case "outbound":
 				if sr.Outbound != nil {
 					scopedOutbounds = append(scopedOutbounds, sr)
@@ -247,14 +266,7 @@ func GetCustomConfig(serverconfig *panel.ServerConfigResponse, inboundTag func(p
 		for _, in := range sr.Inbounds {
 			tags = append(tags, inboundTag(in.Type, in.Port))
 		}
-		rawRule, err := json.Marshal(map[string]interface{}{
-			"inboundTag":  tags,
-			"domain":      parseDomainRules(sr.Domains),
-			"outboundTag": custom.Tag,
-		})
-		if err == nil {
-			coreRouterConfig.RuleList = append(coreRouterConfig.RuleList, rawRule)
-		}
+		coreRouterConfig.RuleList = append(coreRouterConfig.RuleList, routeRules(sr.Domains, custom.Tag, tags)...)
 		if !hasOutboundWithTag(coreOutboundConfig, custom.Tag) {
 			coreOutboundConfig = append(coreOutboundConfig, custom)
 		}
@@ -268,14 +280,7 @@ func GetCustomConfig(serverconfig *panel.ServerConfigResponse, inboundTag func(p
 			if err != nil || custom_outbound == nil {
 				continue
 			}
-			rule := map[string]interface{}{
-				"domain":      parseDomainRules(outbounditem.Rules),
-				"outboundTag": custom_outbound.Tag,
-			}
-			rawRule, err := json.Marshal(rule)
-			if err == nil {
-				coreRouterConfig.RuleList = append(coreRouterConfig.RuleList, rawRule)
-			}
+			coreRouterConfig.RuleList = append(coreRouterConfig.RuleList, routeRules(outbounditem.Rules, custom_outbound.Tag, nil)...)
 			if hasOutboundWithTag(coreOutboundConfig, custom_outbound.Tag) {
 				continue
 			}
