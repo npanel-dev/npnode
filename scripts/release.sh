@@ -2,6 +2,7 @@
 # 发布 NPanel-node 到公开发布仓库（源码仓库保持私有）。
 #
 # 用法：scripts/release.sh <版本号>      例如 scripts/release.sh 1.0.5
+#       scripts/release.sh --scripts-only   只同步 install.sh / npnode.sh / README（不编译、不建 Release）
 #
 # 做的事：
 #   1. 编译 linux 64 / arm64-v8a / s390x，打包成 npnode-linux-<arch>.zip
@@ -24,6 +25,38 @@ fi
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root"
+
+# sync_scripts 把脚本和 README 同步到发布仓库 main 分支
+sync_scripts() {
+    local msg="$1" dir
+    dir="$(mktemp -d)"
+    echo "==> 同步脚本到 $RELEASE_REPO"
+    git clone -q "https://github.com/$RELEASE_REPO.git" "$dir"
+    mkdir -p "$dir/scripts"
+    cp scripts/install.sh scripts/npnode.sh "$dir/scripts/"
+    cp README.md "$dir/README.md"
+    (
+        cd "$dir"
+        git add -A
+        if [[ -n "$(git status --porcelain)" ]]; then
+            git commit -q -m "$msg"
+            git push -q origin HEAD:main
+        else
+            echo "    没有变化"
+        fi
+    )
+    rm -rf "$dir"
+}
+
+if [[ "$version" == "--scripts-only" ]]; then
+    if [[ -n "$(git status --porcelain)" ]]; then
+        echo "源码仓库有未提交的修改，请先提交再同步" >&2
+        exit 1
+    fi
+    sync_scripts "scripts: $(git rev-parse --short HEAD)"
+    echo "完成"
+    exit 0
+fi
 
 if [[ -n "$(git status --porcelain)" ]]; then
     echo "源码仓库有未提交的修改，请先提交再发布" >&2
@@ -57,19 +90,7 @@ for target in "64:amd64" "arm64-v8a:arm64" "s390x:s390x"; do
 done
 (cd "$work/dist" && shasum -a 256 *.zip > checksums.txt)
 
-echo "==> 同步脚本到 $RELEASE_REPO"
-git clone -q "https://github.com/$RELEASE_REPO.git" "$work/release-repo"
-mkdir -p "$work/release-repo/scripts"
-cp scripts/install.sh scripts/npnode.sh "$work/release-repo/scripts/"
-cp README.md "$work/release-repo/README.md"
-(
-    cd "$work/release-repo"
-    git add -A
-    if [[ -n "$(git status --porcelain)" ]]; then
-        git commit -q -m "release: $version"
-        git push -q origin HEAD:main
-    fi
-)
+sync_scripts "release: $version"
 
 echo "==> 创建 Release $version"
 gh release create "$version" --repo "$RELEASE_REPO" --title "Bearnode $version" \
