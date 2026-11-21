@@ -202,6 +202,7 @@ func reload(config string, nodes **node.Node, xcore **core.XrayCore) error {
 	if err != nil {
 		return err
 	}
+	newNodes.InheritTraffic(*nodes)
 	if err := newNodes.Start(); err != nil {
 		return err
 	}

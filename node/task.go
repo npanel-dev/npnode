@@ -166,21 +166,15 @@ func (c *Controller) reportUserTrafficTask(ctx context.Context) (err error) {
 		reportmin = c.info.TrafficReportThreshold
 	}
 	userTraffic, _ := c.server.GetUserTrafficSlice(c.tag, reportmin)
+	c.traffic.add(c.apiClient, userTraffic)
+	// Sync.Send has no per-report acknowledgement. Use HTTP for accounted bytes
+	// and retain the batch until the panel confirms it accepted the report.
+	if err := c.traffic.report(ctx); err != nil {
+		log.WithFields(log.Fields{"tag": c.tag, "err": err}).Info("Report user traffic failed; retained for retry")
+	}
 
-	// Prefer gRPC Sync for traffic reporting (single persistent connection)
+	// Online users and status can still use the Sync stream.
 	if c.grpcClient != nil && c.grpcClient.IsSyncConnected() {
-		// Report traffic via Sync stream
-		if len(userTraffic) > 0 {
-			if err = c.grpcClient.SendTraffic(userTraffic); err != nil {
-				log.WithFields(log.Fields{
-					"tag": c.tag,
-					"err": err,
-				}).Info("gRPC Report user traffic failed")
-			} else {
-				log.WithField("节点", c.tag).Infof("已通过gRPC上报 %d 名用户消耗流量", len(userTraffic))
-			}
-		}
-
 		// Report online users via Sync stream
 		if onlineDevice, err := c.limiter.GetOnlineDevice(); err != nil {
 			log.Print(err)
@@ -208,19 +202,6 @@ func (c *Controller) reportUserTrafficTask(ctx context.Context) (err error) {
 			}).Info("gRPC Report status failed")
 		}
 	} else {
-		// Fallback to HTTP
-		if len(userTraffic) > 0 {
-			err = c.apiClient.ReportUserTraffic(ctx, &userTraffic)
-			if err != nil {
-				log.WithFields(log.Fields{
-					"tag": c.tag,
-					"err": err,
-				}).Info("Report user traffic failed")
-			} else {
-				log.WithField("节点", c.tag).Infof("已上报 %d 名用户消耗流量", len(userTraffic))
-			}
-		}
-
 		if onlineDevice, err := c.limiter.GetOnlineDevice(); err != nil {
 			log.Print(err)
 		} else {

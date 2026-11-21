@@ -21,6 +21,7 @@ type Controller struct {
 	userList                []panel.UserInfo
 	aliveMap                map[int]int
 	info                    *panel.NodeInfo
+	traffic                 *trafficQueue
 	userListMonitorPeriodic *task.Task
 	userReportPeriodic      *task.Task
 	renewCertPeriodic       *task.Task
@@ -33,6 +34,7 @@ func NewController(core *vCore.XrayCore, api *panel.ClientV1, info *panel.NodeIn
 		server:    core,
 		apiClient: api,
 		info:      info,
+		traffic:   newTrafficQueue(),
 	}
 	return controller
 }

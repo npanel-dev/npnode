@@ -2,11 +2,9 @@ package panel
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"path"
-
-	"encoding/json/jsontext"
-	"encoding/json/v2"
 )
 
 type OnlineUser struct {
@@ -58,33 +56,32 @@ func (c *ClientV1) GetUserList(ctx context.Context) ([]UserInfo, error) {
 		return nil, fmt.Errorf("访问 %s 失败: %s", path.Join(c.APIHost+p), string(body))
 	}
 	userlist := &UserListBody{}
-	dec := jsontext.NewDecoder(r.RawResponse.Body)
+	dec := json.NewDecoder(r.RawResponse.Body)
 	for {
-		tok, err := dec.ReadToken()
+		tok, err := dec.Token()
 		if err != nil {
 			return nil, fmt.Errorf("解码用户列表失败: %w", err)
 		}
-		if tok.Kind() == '"' && tok.String() == "users" {
+		if tok == "users" {
 			break
 		}
 	}
-	tok, err := dec.ReadToken()
+	tok, err := dec.Token()
 	if err != nil {
 		return nil, fmt.Errorf("解码用户列表失败: %w", err)
 	}
-	if tok.Kind() != '[' {
+	if tok != json.Delim('[') {
 		return nil, fmt.Errorf(`解码用户列表失败: "users"非数组`)
 	}
-	for dec.PeekKind() != ']' {
-		val, err := dec.ReadValue()
-		if err != nil {
-			return nil, fmt.Errorf("解码用户列表失败: 读取用户对象失败: %w", err)
-		}
+	for dec.More() {
 		var u UserInfo
-		if err := json.Unmarshal(val, &u); err != nil {
+		if err := dec.Decode(&u); err != nil {
 			return nil, fmt.Errorf("解码用户列表失败: 读取用户对象失败: %w", err)
 		}
 		userlist.Users = append(userlist.Users, u)
+	}
+	if _, err := dec.Token(); err != nil {
+		return nil, fmt.Errorf("解码用户列表失败: %w", err)
 	}
 	c.userEtag = r.Header().Get("ETag")
 	return userlist.Users, nil
@@ -148,7 +145,18 @@ func (c *ClientV1) ReportUserTraffic(ctx context.Context, userTraffic *[]UserTra
 		body := r.Body()
 		return fmt.Errorf("访问 %s 失败: %s", path.Join(c.APIHost+p), string(body))
 	}
-
+	if len(r.Body()) > 0 {
+		var result struct {
+			Code int    `json:"code"`
+			Msg  string `json:"msg"`
+		}
+		if err := json.Unmarshal(r.Body(), &result); err != nil {
+			return fmt.Errorf("解码流量上报响应失败: %w", err)
+		}
+		if result.Code != 0 && result.Code != 200 {
+			return fmt.Errorf("流量上报失败: code=%d msg=%s", result.Code, result.Msg)
+		}
+	}
 	return nil
 }
 

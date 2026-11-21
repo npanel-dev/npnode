@@ -11,11 +11,13 @@ import (
 
 type Node struct {
 	controllers []*Controller
+	traffic     *trafficQueue
 }
 
 func New(core *vCore.XrayCore, config *conf.Conf, serverconfig *panel.ServerConfigResponse, grpcClient *panel.GrpcClient) (*Node, error) {
 	node := &Node{
 		controllers: make([]*Controller, len(*serverconfig.Data.Protocols)),
+		traffic:     newTrafficQueue(),
 	}
 	pushinterval := serverconfig.Data.PushInterval
 	if pushinterval <= 0 {
@@ -46,6 +48,7 @@ func New(core *vCore.XrayCore, config *conf.Conf, serverconfig *panel.ServerConf
 			return nil, err
 		}
 		controller := NewController(core, p, n)
+		controller.traffic = node.traffic
 		if grpcClient != nil && !disableGrpc {
 			controller.SetGrpcClient(grpcClient)
 		}
@@ -53,6 +56,18 @@ func New(core *vCore.XrayCore, config *conf.Conf, serverconfig *panel.ServerConf
 	}
 
 	return node, nil
+}
+
+// InheritTraffic retains unacknowledged reports across configuration reloads,
+// including reports whose protocol or destination was removed.
+func (n *Node) InheritTraffic(old *Node) {
+	if old == nil || old.traffic == nil {
+		return
+	}
+	n.traffic = old.traffic
+	for _, c := range n.controllers {
+		c.traffic = n.traffic
+	}
 }
 
 func (n *Node) Start() error {

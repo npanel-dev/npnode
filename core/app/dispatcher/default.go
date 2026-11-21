@@ -37,14 +37,15 @@ type cachedReader struct {
 	sync.Mutex
 	reader buf.TimeoutReader
 	cache  buf.MultiBuffer
+	err    error
 }
 
 func (r *cachedReader) Cache(b *buf.Buffer, deadline time.Duration) error {
 	mb, err := r.reader.ReadMultiBufferTimeout(deadline)
-	if err != nil {
-		return err
-	}
 	r.Lock()
+	if err != nil && err != buf.ErrReadTimeout {
+		r.err = err
+	}
 	if !mb.IsEmpty() {
 		r.cache, _ = buf.MergeMulti(r.cache, mb)
 	}
@@ -53,35 +54,35 @@ func (r *cachedReader) Cache(b *buf.Buffer, deadline time.Duration) error {
 	n := r.cache.Copy(rawBytes)
 	b.Resize(0, int32(n))
 	r.Unlock()
-	return nil
+	return err
 }
 
-func (r *cachedReader) readInternal() buf.MultiBuffer {
+func (r *cachedReader) readInternal() (buf.MultiBuffer, error) {
 	r.Lock()
 	defer r.Unlock()
 
 	if r.cache != nil && !r.cache.IsEmpty() {
 		mb := r.cache
 		r.cache = nil
-		return mb
+		return mb, r.err
 	}
 
-	return nil
+	return nil, r.err
 }
 
 func (r *cachedReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
-	mb := r.readInternal()
-	if mb != nil {
-		return mb, nil
+	mb, err := r.readInternal()
+	if mb != nil || err != nil {
+		return mb, err
 	}
 
 	return r.reader.ReadMultiBuffer()
 }
 
 func (r *cachedReader) ReadMultiBufferTimeout(timeout time.Duration) (buf.MultiBuffer, error) {
-	mb := r.readInternal()
-	if mb != nil {
-		return mb, nil
+	mb, err := r.readInternal()
+	if mb != nil || err != nil {
+		return mb, err
 	}
 
 	return r.reader.ReadMultiBufferTimeout(timeout)
@@ -214,8 +215,8 @@ func (d *DefaultDispatcher) getLink(ctx context.Context, network net.Network) (*
 		}
 		var t *counter.TrafficCounter
 		if c, ok := d.Counter.Load(sessionInbound.Tag); !ok {
-			t = counter.NewTrafficCounter()
-			d.Counter.Store(sessionInbound.Tag, t)
+			stored, _ := d.Counter.LoadOrStore(sessionInbound.Tag, counter.NewTrafficCounter())
+			t = stored.(*counter.TrafficCounter)
 		} else {
 			t = c.(*counter.TrafficCounter)
 		}
@@ -394,8 +395,8 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 		}
 		var t *counter.TrafficCounter
 		if c, ok := d.Counter.Load(sessionInbound.Tag); !ok {
-			t = counter.NewTrafficCounter()
-			d.Counter.Store(sessionInbound.Tag, t)
+			stored, _ := d.Counter.LoadOrStore(sessionInbound.Tag, counter.NewTrafficCounter())
+			t = stored.(*counter.TrafficCounter)
 		} else {
 			t = c.(*counter.TrafficCounter)
 		}
