@@ -29,7 +29,7 @@ import (
 
 var (
 	// ReleaseBase 官方发布仓库，不接受面板指定
-	ReleaseBase = "https://github.com/yunsen1599/Bearnode/releases"
+	ReleaseBase = "https://github.com/npanel-dev/npnode/releases"
 	// StateDir 记录已处理的请求，启动时设为配置文件所在目录
 	StateDir = "/etc/NPanel-node"
 

@@ -47,7 +47,7 @@ func writeTestCert(t *testing.T, dir string) (string, string, *x509.Certificate)
 // 用标准库客户端带面板下发给订阅的 ech_config_list 握手：ECH 必须被接受。
 func TestECHServerKeysAcceptedByXray(t *testing.T) {
 	certFile, keyFile, leaf := writeTestCert(t, t.TempDir())
-	tlsSettings := &coreConf.TLSConfig{Certs: []*coreConf.TLSCertConfig{{CertFile: certFile, KeyFile: keyFile}}}
+	tlsSettings := &coreConf.TLSConfig{Certs: []*coreConf.TLSCertConfig{buildTLSCertificate(certFile, keyFile)}}
 	applyECH(&panel.NodeInfo{Type: "vless", Protocol: &panel.Protocol{EchEnabled: true, EchServerKeys: testECHServerKeys}}, tlsSettings)
 	if tlsSettings.ECHServerKeys == "" {
 		t.Fatal("applyECH did not set echServerKeys")

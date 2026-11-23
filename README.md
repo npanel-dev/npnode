@@ -1,7 +1,19 @@
-# Bearnode
+# NPanel-node
 
 A NPanel node server based on xray-core, modified from v2node.  
 一个基于xray内核的NPanel节点服务端，修改自v2node
+
+## 面板对接能力
+
+- 支持 ECH、受信任的真实 IP 请求头、SOCKS / HTTP 入站，以及按协议和端口限定的分流规则。
+- 支持面板生成的完整出站配置，可将已有节点用作出站。
+- 支持 gRPC 用户增量推送、配置变更通知和状态版本上报；gRPC 不可用时自动回退 HTTP，并定期尝试恢复。
+- 流量上报失败和配置重载后保留待上报字节；gRPC 重试沿用相同的上报 ID 和内容，新采集的流量单独累计。
+- 支持证书申请结果上报、远程升级，以及安装脚本使用本地安装包。安装、更新均使用 `npanel-dev/npnode`。
+
+证书由 Node 统一管理重载：HTTP/DNS 续期成功后自动生效；文件模式每分钟检查一次，确认新证书与私钥匹配后重载节点。gRPC 中尚未确认的批次保留原 ID 等待重试，之后新采集的流量仍可经 HTTP 上报。
+
+当前 Xray 内核为 26.10.31，构建需要 Go 1.27.3。该内核默认限制部分代理协议访问私网及回环目标；回归测试仅在测试出站中放行回环地址。
 
 ## 单服务器多 IP 出站
 
@@ -33,7 +45,7 @@ GOEXPERIMENT=jsonv2 go test ./core -run '^TestVLESSWildcardInboundPreservesEntry
 ### 一键安装
 
 ```
-wget -N https://raw.githubusercontent.com/yunsen1599/Bearnode/main/scripts/install.sh && bash install.sh
+wget -N https://raw.githubusercontent.com/npanel-dev/npnode/main/scripts/install.sh && bash install.sh
 ```
 
 ## 构建
@@ -43,7 +55,7 @@ GOEXPERIMENT=jsonv2 go build -v -o ./npnode -trimpath -ldflags "-s -w -buildid="
 
 ## 发布
 
-源码仓库是私有的，安装脚本和安装包发布在公开仓库 [yunsen1599/Bearnode](https://github.com/yunsen1599/Bearnode)，节点服务器无需任何凭据即可一键安装和更新。
+源码、安装脚本和安装包统一使用公开仓库 [npanel-dev/npnode](https://github.com/npanel-dev/npnode)，节点服务器无需任何凭据即可一键安装和更新。
 
 ``` bash
 scripts/release.sh 1.0.5

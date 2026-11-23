@@ -2,6 +2,8 @@ package core
 
 import (
 	"bytes"
+	"context"
+	"encoding/json"
 	"io"
 	"net"
 	"testing"
@@ -12,6 +14,9 @@ import (
 	"github.com/npanel-dev/npnode/limiter"
 	xnet "github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
+	xcore "github.com/xtls/xray-core/core"
+	"github.com/xtls/xray-core/features/outbound"
+	coreConf "github.com/xtls/xray-core/infra/conf"
 	"github.com/xtls/xray-core/proxy/vless/encoding"
 )
 
@@ -40,6 +45,7 @@ func TestVLESSLoopbackTrafficMatchesTransferredPayload(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { vc.Close() })
+	allowLoopbackTestOutbound(t, vc)
 	const tag = "test-vless-traffic"
 	users := []panel.UserInfo{{Id: 7, Uuid: "6e8fac3f-bf7a-4a48-b28a-43bb660e2a19"}}
 	limiter.Init()
@@ -94,5 +100,28 @@ func TestVLESSLoopbackTrafficMatchesTransferredPayload(t *testing.T) {
 	}
 	if len(traffic) != 1 || traffic[0].UID != 7 || traffic[0].Upload != int64(len(payload)) || traffic[0].Download != int64(len(payload)) {
 		t.Fatalf("transferred %d bytes each way, reported %+v", len(payload), traffic)
+	}
+}
+
+// The new core blocks private destinations by default. Only the loopback test
+// outbound permits 127.0.0.0/8; production keeps the core's default policy.
+func allowLoopbackTestOutbound(t *testing.T, vc *XrayCore) {
+	t.Helper()
+	settings := json.RawMessage(`{"finalRules":[{"action":"allow","ip":["127.0.0.0/8"]}]}`)
+	config, err := (&coreConf.OutboundDetourConfig{Tag: "Default", Protocol: "freedom", Settings: &settings}).Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := xcore.CreateObject(vc.Server, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := vc.ohm.GetHandler("Default")
+	if err := vc.ohm.RemoveHandler(context.Background(), "Default"); err != nil {
+		t.Fatal(err)
+	}
+	old.Close()
+	if err := vc.ohm.AddHandler(context.Background(), raw.(outbound.Handler)); err != nil {
+		t.Fatal(err)
 	}
 }

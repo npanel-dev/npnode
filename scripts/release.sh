@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 发布 NPanel-node 到公开发布仓库（源码仓库保持私有）。
+# 发布 NPanel-node 到指定的公开仓库。
 #
 # 用法：scripts/release.sh <版本号>      例如 scripts/release.sh 1.0.5
 #       scripts/release.sh --scripts-only   只同步 install.sh / npnode.sh / README（不编译、不建 Release）
@@ -14,7 +14,7 @@
 # 依赖：go、zip、gh（已登录且对发布仓库有写权限）、git、curl、shasum
 set -euo pipefail
 
-RELEASE_REPO="${RELEASE_REPO:-yunsen1599/Bearnode}"
+RELEASE_REPO="${RELEASE_REPO:-npanel-dev/npnode}"
 GEO_BASE="${GEO_BASE:-https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download}"
 
 version="${1:-}"
@@ -93,11 +93,11 @@ done
 sync_scripts "release: $version"
 
 echo "==> 创建 Release $version"
-gh release create "$version" --repo "$RELEASE_REPO" --title "Bearnode $version" \
+gh release create "$version" --repo "$RELEASE_REPO" --title "NPanel-node $version" \
     --notes "源码提交：$(git rev-parse --short HEAD)" "$work"/dist/*
 
 echo "==> 源码仓库打 tag $version"
-git tag -a "$version" -m "Bearnode $version"
+git tag -a "$version" -m "NPanel-node $version"
 git push -q origin "$version"
 
 echo "完成：https://github.com/$RELEASE_REPO/releases/tag/$version"

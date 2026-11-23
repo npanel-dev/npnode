@@ -1,6 +1,7 @@
 package node
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
@@ -19,6 +20,50 @@ import (
 	vCore "github.com/npanel-dev/npnode/core"
 	nodev1 "github.com/npanel-dev/npnode/proto/node/v1"
 )
+
+func TestFileCertificateReloadWaitsForMatchingKey(t *testing.T) {
+	c, certFile, keyFile, _ := newCertTestController(t, "file", "example.com")
+	c.server = &vCore.XrayCore{ReloadCh: make(chan struct{}, 1)}
+	writeCASigned(t, certFile, keyFile, "example.com", 24*time.Hour)
+	var err error
+	c.fileCertHash, err = c.fileCertDigest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldKey, err := os.ReadFile(keyFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.renewCertTask(context.Background())
+	if len(c.server.ReloadCh) != 0 {
+		t.Fatal("unchanged certificate triggered reload")
+	}
+	writeCASigned(t, certFile, keyFile, "example.com", 48*time.Hour)
+	newKey, err := os.ReadFile(keyFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyFile, oldKey, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c.renewCertTask(context.Background())
+	if len(c.server.ReloadCh) != 0 {
+		t.Fatal("mismatched certificate and key triggered reload")
+	}
+	if err := os.WriteFile(keyFile, newKey, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c.renewCertTask(context.Background())
+	select {
+	case <-c.server.ReloadCh:
+	default:
+		t.Fatal("replacement certificate did not trigger reload")
+	}
+	c.renewCertTask(context.Background())
+	if len(c.server.ReloadCh) != 0 {
+		t.Fatal("unchanged replacement triggered duplicate reload")
+	}
+}
 
 // writeCASigned 写一张由测试 CA 签发的证书（非自签）
 func writeCASigned(t *testing.T, certFile, keyFile, domain string, validFor time.Duration) {

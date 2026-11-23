@@ -359,7 +359,7 @@ install_npnode() {
         fi
         if [[ -z "$version_param" ]]; then
             last_version=""
-            if fetch "https://api.github.com/repos/yunsen1599/Bearnode/releases/latest" "$work/latest.json"; then
+            if fetch "https://api.github.com/repos/npanel-dev/npnode/releases/latest" "$work/latest.json"; then
                 last_version=$(grep '"tag_name":' "$work/latest.json" | sed -E 's/.*"([^"]+)".*/\1/')
             fi
             if [[ -z "$last_version" ]]; then
@@ -369,7 +369,7 @@ install_npnode() {
         else
             last_version=$version_param
         fi
-        url="https://github.com/yunsen1599/Bearnode/releases/download/${last_version}/npnode-linux-${arch}.zip"
+        url="https://github.com/npanel-dev/npnode/releases/download/${last_version}/npnode-linux-${arch}.zip"
         if ! fetch "$url" "$zip"; then
             download_failed "下载 NPanel-node ${last_version} 失败，请确保此版本存在、服务器能够下载 Github 的文件"
         fi
@@ -481,7 +481,7 @@ EOF
     if [[ -n "$MANAGE_SCRIPT_ARG" && -f "$MANAGE_SCRIPT_ARG" ]]; then
         cp "$MANAGE_SCRIPT_ARG" /usr/bin/npnode
         chmod +x /usr/bin/npnode
-    elif fetch https://raw.githubusercontent.com/yunsen1599/Bearnode/main/scripts/npnode.sh /usr/bin/npnode.new; then
+    elif fetch https://raw.githubusercontent.com/npanel-dev/npnode/main/scripts/npnode.sh /usr/bin/npnode.new; then
         mv /usr/bin/npnode.new /usr/bin/npnode
         chmod +x /usr/bin/npnode
     else

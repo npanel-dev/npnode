@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha256"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
@@ -151,6 +153,18 @@ func (c *Controller) ensureACMECert() (renewed bool, err error) {
 
 // renewCertTask 每天检查一次：证书快过期 / 不可用就重新申请，成功后重载节点使新证书生效。
 func (c *Controller) renewCertTask(_ context.Context) error {
+	if c.info.Protocol.CertMode == "file" {
+		digest, err := c.fileCertDigest()
+		if err != nil {
+			log.WithField("err", err).Warn("证书文件尚未就绪，继续使用已加载的证书")
+			return nil
+		}
+		if digest != c.fileCertHash {
+			c.fileCertHash = digest
+			c.triggerReload()
+		}
+		return nil
+	}
 	if mode := c.info.Protocol.CertMode; mode != "http" && mode != "dns" {
 		return nil
 	}
@@ -159,6 +173,24 @@ func (c *Controller) renewCertTask(_ context.Context) error {
 		c.triggerReload()
 	}
 	return nil
+}
+
+func (c *Controller) fileCertDigest() ([32]byte, error) {
+	certFile, keyFile := certPathsFor(c)
+	if _, err := os.Stat(certFile); os.IsNotExist(err) {
+		certFile, keyFile = c.info.LegacyCertFilePath(), c.info.LegacyKeyFilePath()
+	}
+	pair, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return [32]byte{}, err
+	}
+	hash := sha256.New()
+	for _, cert := range pair.Certificate {
+		hash.Write(cert)
+	}
+	var digest [32]byte
+	copy(digest[:], hash.Sum(nil))
+	return digest, nil
 }
 
 func (c *Controller) triggerReload() {

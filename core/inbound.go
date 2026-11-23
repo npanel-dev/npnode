@@ -118,10 +118,7 @@ func buildInboundWithUsers(nodeInfo *panel.NodeInfo, tag string, plainUsers []st
 			}
 			in.StreamSetting.TLSSettings = &coreConf.TLSConfig{
 				Certs: []*coreConf.TLSCertConfig{
-					{
-						CertFile: certFile,
-						KeyFile:  keyFile,
-					},
+					buildTLSCertificate(certFile, keyFile),
 				},
 			}
 			applyQUICALPN(nodeInfo.Type, in.StreamSetting.TLSSettings)
@@ -160,6 +157,12 @@ func buildInboundWithUsers(nodeInfo *panel.NodeInfo, tag string, plainUsers []st
 	}
 	in.Tag = tag
 	return in.Build()
+}
+
+// Node certificate tasks reload the inbound after renewal or file replacement.
+// Avoid the core's concurrent certificate-slice mutation during handshakes.
+func buildTLSCertificate(certFile, keyFile string) *coreConf.TLSCertConfig {
+	return &coreConf.TLSCertConfig{CertFile: certFile, KeyFile: keyFile, OneTimeLoading: true}
 }
 
 func buildStreamSetting(p *panel.Protocol) (*coreConf.StreamConfig, error) {

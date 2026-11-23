@@ -15,8 +15,6 @@ import (
 )
 
 type Controller struct {
-	// pendingTraffic 已从内核读出、尚未被面板确认的流量
-	pendingTraffic []pendingTrafficReport
 	// userMu 保护 userList / syncVersion / lastFullSync：推送与定时拉取会并发修改
 	userMu sync.Mutex
 	// syncVersion 已应用的推送版本，0 表示推送未就绪（未收到全量或流已断开）
@@ -35,6 +33,7 @@ type Controller struct {
 	userListMonitorPeriodic *task.Task
 	userReportPeriodic      *task.Task
 	renewCertPeriodic       *task.Task
+	fileCertHash            [32]byte
 	// started 入站已加入内核；证书不可用时为 false，由 certRetryStop 对应的协程定时重试
 	started                bool
 	certRetryStop          chan struct{}

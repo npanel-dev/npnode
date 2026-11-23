@@ -37,6 +37,8 @@ func (c *Controller) startTasks(node *panel.NodeInfo) {
 		security = node.Protocol.Security
 	case "trojan":
 		security = node.Protocol.Security
+	case "anytls":
+		security = node.Protocol.Security
 	case "shadowsocks":
 		security = ""
 	case "tuic":
@@ -49,11 +51,16 @@ func (c *Controller) startTasks(node *panel.NodeInfo) {
 
 	if security == "tls" {
 		switch node.Protocol.CertMode {
-		case "none", "", "file", "self":
+		case "none", "", "self":
 		default:
+			interval := 24 * time.Hour
+			if node.Protocol.CertMode == "file" {
+				c.fileCertHash, _ = c.fileCertDigest()
+				interval = time.Minute
+			}
 			c.renewCertPeriodic = &task.Task{
 				Name:     "renewCert",
-				Interval: time.Hour * 24,
+				Interval: interval,
 				Execute:  c.renewCertTask,
 				ReloadCh: c.server.ReloadCh,
 			}
@@ -190,56 +197,25 @@ func (c *Controller) reportUserTrafficTask(ctx context.Context) (err error) {
 	return nil
 }
 
-// maxPendingTrafficReports 待上报队列上限：面板长时间不可用时丢弃最旧的批次，避免内存无限增长
-const maxPendingTrafficReports = 100
-
-type pendingTrafficReport struct {
-	// reportID 首次经 gRPC 发送时分配，之后重发沿用，面板据此去重
-	reportID string
-	traffic  []panel.UserTraffic
+// queueTrafficReport keeps collected bytes in the node-wide queue across reloads.
+func (c *Controller) queueTrafficReport(traffic []panel.UserTraffic) {
+	if c.traffic == nil {
+		c.traffic = newTrafficQueue()
+	}
+	c.traffic.add(c.apiClient, traffic)
 }
 
-func (c *Controller) queueTrafficReport(traffic []panel.UserTraffic) {
-	if len(traffic) == 0 {
+func (c *Controller) flushPendingTraffic(ctx context.Context, useSync bool) {
+	if c.traffic == nil {
 		return
 	}
-	c.pendingTraffic = append(c.pendingTraffic, pendingTrafficReport{traffic: traffic})
-	if over := len(c.pendingTraffic) - maxPendingTrafficReports; over > 0 {
-		log.WithField("节点", c.tag).Errorf("面板长时间无法接收流量，丢弃最早的 %d 批流量上报", over)
-		c.pendingTraffic = c.pendingTraffic[over:]
+	var gc *panel.GrpcClient
+	if useSync {
+		gc = c.grpcClient
 	}
-}
-
-// flushPendingTraffic 按顺序上报待上报队列，遇到失败即停止，剩余的下一轮再试。
-func (c *Controller) flushPendingTraffic(ctx context.Context, useSync bool) {
-	sent := 0
-	for i := range c.pendingTraffic {
-		report := &c.pendingTraffic[i]
-		var err error
-		if useSync {
-			if report.reportID == "" {
-				report.reportID = c.grpcClient.NewTrafficReportID()
-			}
-			err = c.grpcClient.SendTraffic(report.reportID, c.info.Type, c.info.Protocol.Port, report.traffic)
-		} else {
-			err = c.apiClient.ReportUserTraffic(ctx, &report.traffic)
-		}
-		if err != nil {
-			log.WithFields(log.Fields{
-				"tag":     c.tag,
-				"err":     err,
-				"pending": len(c.pendingTraffic) - sent,
-			}).Warn("上报用户流量失败，下一轮重试")
-			break
-		}
-		sent++
-		via := "HTTP"
-		if useSync {
-			via = "gRPC"
-		}
-		log.WithField("节点", c.tag).Infof("已通过%s上报 %d 名用户消耗流量", via, len(report.traffic))
+	if err := c.traffic.reportVia(ctx, c.apiClient, gc); err != nil {
+		log.WithFields(log.Fields{"tag": c.tag, "err": err}).Warn("上报用户流量失败，保留到下一轮重试")
 	}
-	c.pendingTraffic = c.pendingTraffic[sent:]
 }
 
 func onlineUsersForReport(onlineDevices []panel.OnlineUser, userTraffic []panel.UserTraffic) []panel.OnlineUser {

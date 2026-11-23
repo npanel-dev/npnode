@@ -35,6 +35,7 @@ func TestVLESSWildcardInboundPreservesEntryIP(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { vc.Close() })
+	allowLoopbackTestOutbound(t, vc)
 	const tag = "test-vless-source-ip"
 	users := []panel.UserInfo{{Id: 7, Uuid: "6e8fac3f-bf7a-4a48-b28a-43bb660e2a19"}}
 	limiter.Init()
