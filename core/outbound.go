@@ -13,8 +13,7 @@ func buildDefaultOutbound() (*core.OutboundHandlerConfig, error) {
 	outboundDetourConfig := &conf.OutboundDetourConfig{}
 	outboundDetourConfig.Protocol = "freedom"
 	outboundDetourConfig.Tag = "Default"
-	//sendthrough := "origin"
-	//outboundDetourConfig.SendThrough = &sendthrough
+	// The dispatcher selects the source address for each direct connection.
 
 	proxySetting := &conf.FreedomConfig{
 		DomainStrategy: "UseIPv4v6",
