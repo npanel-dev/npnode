@@ -185,8 +185,7 @@ func GetCustomConfig(serverconfig *panel.ServerConfigResponse, inboundTag func(p
 	}
 	coreDnsConfig := &coreConf.DNSConfig{QueryStrategy: queryStrategy}
 
-	// custom dns：带域名的只解析这些域名；不带域名的是全局 DNS，排在系统 DNS 之前，
-	// 未命中域名规则的查询都先交给它，查询失败时 Xray 再回落到系统 DNS。
+	// custom dns：带域名的只解析这些域名；不带域名的是全局 DNS，取代系统 DNS。
 	var globalServers, domainServers []*coreConf.NameServerConfig
 	if dnsConfig != nil {
 		for _, item := range *dnsConfig {
@@ -206,14 +205,20 @@ func GetCustomConfig(serverconfig *panel.ServerConfigResponse, inboundTag func(p
 			}
 		}
 	}
-	// 系统 DNS（/etc/resolv.conf）：没有全局 DNS 时是主 DNS，有全局 DNS 时作兜底
-	localDNS := &coreConf.NameServerConfig{
-		Address: &coreConf.Address{
-			Address: xnet.ParseAddress("localhost"),
-		},
+	if len(globalServers) > 0 {
+		// 全局 DNS 等同于把它写进 /etc/resolv.conf：它返回什么就用什么。
+		// 最后一个全局 DNS 设为 finalQuery，查询到此为止，空应答 / NXDOMAIN 也不再回落到后面的 DNS。
+		// 解锁 DNS 常对部分域名故意返回空，回落会拿到真实 IP，让同一业务的请求从两个出口出去（如 Netflix 登录报错）。
+		globalServers[len(globalServers)-1].FinalQuery = true
+		coreDnsConfig.Servers = append(coreDnsConfig.Servers, globalServers...)
+	} else {
+		// 没有全局 DNS：用系统 DNS（/etc/resolv.conf）
+		coreDnsConfig.Servers = append(coreDnsConfig.Servers, &coreConf.NameServerConfig{
+			Address: &coreConf.Address{
+				Address: xnet.ParseAddress("localhost"),
+			},
+		})
 	}
-	coreDnsConfig.Servers = append(coreDnsConfig.Servers, globalServers...)
-	coreDnsConfig.Servers = append(coreDnsConfig.Servers, localDNS)
 	coreDnsConfig.Servers = append(coreDnsConfig.Servers, domainServers...)
 
 	//default outbound
