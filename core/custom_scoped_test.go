@@ -2,6 +2,7 @@ package core
 
 import (
 	"net"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -121,30 +122,47 @@ func TestBlockIPAndProtocolRules(t *testing.T) {
 	}
 }
 
-// 不带域名的 DNS 是全局 DNS：排在系统 DNS（localhost）之前；带域名的保持在后面，靠域名优先匹配
-func TestGlobalDNSBeforeLocalhost(t *testing.T) {
-	cfg := &panel.ServerConfigResponse{Data: &panel.Data{
-		DNS: &[]panel.DNSItem{
-			{Address: "8.8.8.8", Domains: []string{"suffix:google.com"}},
-			{Address: "9.9.9.9"},
-		},
-	}}
-	dnsCfg, _, _, err := GetCustomConfig(cfg, nil)
+// dnsOrder 返回 DNS 服务器地址顺序和各自的 finalQuery
+func dnsOrder(t *testing.T, items []panel.DNSItem) (string, string) {
+	t.Helper()
+	dnsCfg, _, _, err := GetCustomConfig(&panel.ServerConfigResponse{Data: &panel.Data{DNS: &items}}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var got []string
+	var addrs, finals []string
 	for _, ns := range dnsCfg.NameServer {
 		addr := ns.GetAddress().GetAddress()
 		if d := addr.GetDomain(); d != "" {
-			got = append(got, d)
+			addrs = append(addrs, d)
 		} else {
-			got = append(got, net.IP(addr.GetIp()).String())
+			addrs = append(addrs, net.IP(addr.GetIp()).String())
 		}
+		finals = append(finals, strconv.FormatBool(ns.GetFinalQuery()))
 	}
-	want := []string{"9.9.9.9", "localhost", "8.8.8.8"}
-	if strings.Join(got, ",") != strings.Join(want, ",") {
-		t.Fatalf("dns order = %v, want %v", got, want)
+	return strings.Join(addrs, ","), strings.Join(finals, ",")
+}
+
+// 不带域名的 DNS 是全局 DNS：取代系统 DNS（不再有 localhost），最后一个全局 DNS 是 finalQuery，
+// 空应答不会回落；带域名的排在后面，靠域名优先匹配
+func TestGlobalDNSReplacesLocalhost(t *testing.T) {
+	addrs, finals := dnsOrder(t, []panel.DNSItem{
+		{Address: "8.8.8.8", Domains: []string{"suffix:google.com"}},
+		{Address: "9.9.9.9"},
+		{Address: "1.1.1.1"},
+	})
+	if addrs != "9.9.9.9,1.1.1.1,8.8.8.8" {
+		t.Fatalf("dns order = %s", addrs)
+	}
+	if finals != "false,true,false" {
+		t.Fatalf("finalQuery = %s", finals)
+	}
+}
+
+// 只有带域名的 DNS：系统 DNS 仍是主 DNS，行为与之前一致
+func TestDomainDNSKeepsLocalhost(t *testing.T) {
+	addrs, finals := dnsOrder(t, []panel.DNSItem{{Address: "8.8.8.8", Domains: []string{"suffix:google.com"}}})
+	if addrs != "localhost,8.8.8.8" || finals != "false,false" {
+		t.Fatalf("dns order = %s, finalQuery = %s", addrs, finals)
 	}
 }
 
