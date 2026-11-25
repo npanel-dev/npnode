@@ -183,18 +183,11 @@ func GetCustomConfig(serverconfig *panel.ServerConfigResponse, inboundTag func(p
 	if !hasPublicIPv6() {
 		queryStrategy = "UseIPv4"
 	}
-	coreDnsConfig := &coreConf.DNSConfig{
-		Servers: []*coreConf.NameServerConfig{
-			{
-				Address: &coreConf.Address{
-					Address: xnet.ParseAddress("localhost"),
-				},
-			},
-		},
-		QueryStrategy: queryStrategy,
-	}
+	coreDnsConfig := &coreConf.DNSConfig{QueryStrategy: queryStrategy}
 
-	//custom dns
+	// custom dns：带域名的只解析这些域名；不带域名的是全局 DNS，排在系统 DNS 之前，
+	// 未命中域名规则的查询都先交给它，查询失败时 Xray 再回落到系统 DNS。
+	var globalServers, domainServers []*coreConf.NameServerConfig
 	if dnsConfig != nil {
 		for _, item := range *dnsConfig {
 			address, port := dnsServerAddress(item.Address)
@@ -206,9 +199,22 @@ func GetCustomConfig(serverconfig *panel.ServerConfigResponse, inboundTag func(p
 				QueryStrategy: ip_strategy,
 				Domains:       parseDomainRules(item.Domains),
 			}
-			coreDnsConfig.Servers = append(coreDnsConfig.Servers, server)
+			if len(server.Domains) == 0 {
+				globalServers = append(globalServers, server)
+			} else {
+				domainServers = append(domainServers, server)
+			}
 		}
 	}
+	// 系统 DNS（/etc/resolv.conf）：没有全局 DNS 时是主 DNS，有全局 DNS 时作兜底
+	localDNS := &coreConf.NameServerConfig{
+		Address: &coreConf.Address{
+			Address: xnet.ParseAddress("localhost"),
+		},
+	}
+	coreDnsConfig.Servers = append(coreDnsConfig.Servers, globalServers...)
+	coreDnsConfig.Servers = append(coreDnsConfig.Servers, localDNS)
+	coreDnsConfig.Servers = append(coreDnsConfig.Servers, domainServers...)
 
 	//default outbound
 	defaultoutbound, _ := buildDefaultOutbound()

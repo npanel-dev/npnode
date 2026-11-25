@@ -1,6 +1,8 @@
 package core
 
 import (
+	"net"
+	"strings"
 	"testing"
 
 	"github.com/npanel-dev/npnode/api/panel"
@@ -116,5 +118,42 @@ func TestBlockIPAndProtocolRules(t *testing.T) {
 	}
 	if a, p := dnsServerAddress("tcp://8.8.8.8:53"); a != "tcp://8.8.8.8:53" || p != 0 {
 		t.Fatalf("url address changed: %s %d", a, p)
+	}
+}
+
+// 不带域名的 DNS 是全局 DNS：排在系统 DNS（localhost）之前；带域名的保持在后面，靠域名优先匹配
+func TestGlobalDNSBeforeLocalhost(t *testing.T) {
+	cfg := &panel.ServerConfigResponse{Data: &panel.Data{
+		DNS: &[]panel.DNSItem{
+			{Address: "8.8.8.8", Domains: []string{"suffix:google.com"}},
+			{Address: "9.9.9.9"},
+		},
+	}}
+	dnsCfg, _, _, err := GetCustomConfig(cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, ns := range dnsCfg.NameServer {
+		addr := ns.GetAddress().GetAddress()
+		if d := addr.GetDomain(); d != "" {
+			got = append(got, d)
+		} else {
+			got = append(got, net.IP(addr.GetIp()).String())
+		}
+	}
+	want := []string{"9.9.9.9", "localhost", "8.8.8.8"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("dns order = %v, want %v", got, want)
+	}
+}
+
+func TestNoCustomDNSUsesLocalhost(t *testing.T) {
+	dnsCfg, _, _, err := GetCustomConfig(&panel.ServerConfigResponse{Data: &panel.Data{}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dnsCfg.NameServer) != 1 || dnsCfg.NameServer[0].GetAddress().GetAddress().GetDomain() != "localhost" {
+		t.Fatalf("default dns = %v", dnsCfg.NameServer)
 	}
 }
