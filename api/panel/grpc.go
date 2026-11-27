@@ -86,6 +86,9 @@ func parseGrpcAddr(raw string) (addr string, useTLS bool) {
 	return host, u.Scheme == "https"
 }
 
+// grpcMaxRecvMsgSize gRPC 接收上限（10 万条用户约 5.5 MB）
+const grpcMaxRecvMsgSize = 64 << 20
+
 // NewGrpcClient creates a new gRPC client connected to the panel server.
 func NewGrpcClient(cfg *conf.GrpcConfig, secretKey string, serverID int) (*GrpcClient, error) {
 	addr, useTLS := parseGrpcAddr(cfg.Addr)
@@ -114,6 +117,8 @@ func NewGrpcClient(cfg *conf.GrpcConfig, secretKey string, serverID int) (*GrpcC
 			Timeout:             10 * time.Second,
 			PermitWithoutStream: true,
 		}),
+		// 一元 GetUserList 不分片，名额条目会让列表超过默认 4 MB 接收上限
+		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(grpcMaxRecvMsgSize)),
 	}
 
 	conn, err := grpc.NewClient(addr, opts...)
@@ -153,9 +158,10 @@ func (g *GrpcClient) Close() error {
 func (g *GrpcClient) GetConfig(ctx context.Context, protocols []string) (*nodev1.GetConfigResponse, error) {
 	ctx = g.authContext(ctx)
 	resp, err := g.client.GetConfig(ctx, &nodev1.GetConfigRequest{
-		ServerId:  g.serverID,
-		SecretKey: g.secretKey,
-		Protocols: protocols,
+		ServerId:     g.serverID,
+		SecretKey:    g.secretKey,
+		Protocols:    protocols,
+		Capabilities: CapabilityList(),
 	})
 	if err != nil {
 		st := status.Convert(err)
@@ -169,9 +175,10 @@ func (g *GrpcClient) GetConfig(ctx context.Context, protocols []string) (*nodev1
 func (g *GrpcClient) GetUserList(ctx context.Context, protocol string, port int) ([]UserInfo, error) {
 	ctx = g.authContext(ctx)
 	req := &nodev1.GetUserListRequest{
-		ServerId:  g.serverID,
-		SecretKey: g.secretKey,
-		Protocol:  protocol,
+		ServerId:     g.serverID,
+		SecretKey:    g.secretKey,
+		Protocol:     protocol,
+		Capabilities: CapabilityList(),
 	}
 	if port > 0 && port <= 65535 {
 		req.Port = uint32(port)
@@ -281,7 +288,8 @@ func (g *GrpcClient) Subscribe(inbounds ...Inbound) error {
 	}
 	sub := &nodev1.Subscribe{}
 	for _, in := range inbounds {
-		sub.Inbounds = append(sub.Inbounds, &nodev1.Inbound{Protocol: in.Protocol, Port: clampPort(in.Port)})
+		// 每个入站都带能力：面板按能力把会话分到不同推送通道（重新订阅时同样要带）
+		sub.Inbounds = append(sub.Inbounds, &nodev1.Inbound{Protocol: in.Protocol, Port: clampPort(in.Port), Capabilities: CapabilityList()})
 	}
 	return g.sendSync(&nodev1.SyncRequest{Payload: &nodev1.SyncRequest_Subscribe{Subscribe: sub}})
 }
@@ -628,6 +636,9 @@ func (g *GrpcClient) authContext(ctx context.Context) context.Context {
 		"secret-key", g.secretKey,
 		"server-id", fmt.Sprintf("%d", g.serverID),
 	)
+	if agent := NodeAgent(); agent != "" {
+		md.Set("x-node-agent", agent)
+	}
 	return metadata.NewOutgoingContext(ctx, md)
 }
 

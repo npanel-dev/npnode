@@ -75,6 +75,13 @@ func NewClientV1(c *conf.NodeApiConfig) (*ClientV1, error) {
 	if c.Port > 0 {
 		params["port"] = strconv.Itoa(c.Port)
 	}
+	// 声明能力时才附加 capabilities 与 X-Node-Agent，关闭时请求与旧版一致
+	if caps := CapabilityParam(); caps != "" {
+		params["capabilities"] = caps
+	}
+	if agent := NodeAgent(); agent != "" {
+		client.SetHeader("X-Node-Agent", agent)
+	}
 	client.SetQueryParams(params)
 	return &ClientV1{
 		Client:    client,
@@ -103,9 +110,16 @@ func NewClientV2(c *conf.ServerApiConfig) *ClientV2 {
 		}
 	})
 	client.SetBaseURL(c.ApiHost)
-	client.SetQueryParams(map[string]string{
+	params := map[string]string{
 		"secret_key": c.SecretKey,
-	})
+	}
+	if caps := CapabilityParam(); caps != "" {
+		params["capabilities"] = caps
+	}
+	if agent := NodeAgent(); agent != "" {
+		client.SetHeader("X-Node-Agent", agent)
+	}
+	client.SetQueryParams(params)
 	return &ClientV2{
 		Client:    client,
 		APIHost:   c.ApiHost,
