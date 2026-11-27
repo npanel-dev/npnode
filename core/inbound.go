@@ -257,23 +257,9 @@ func applyProxyProtocolSockopt(stream *coreConf.StreamConfig, enabled bool) {
 
 func buildVLess(nodeInfo *panel.NodeInfo, inbound *coreConf.InboundDetourConfig) error {
 	inbound.Protocol = "vless"
-	decryption := "none"
-	if nodeInfo.Protocol.Encryption != "" && nodeInfo.Protocol.Encryption != "none" {
-		switch nodeInfo.Protocol.Encryption {
-		case "mlkem768x25519plus":
-			parts := []string{
-				"mlkem768x25519plus",
-				nodeInfo.Protocol.EncryptionMode,
-				nodeInfo.Protocol.EncryptionTicket + "s",
-			}
-			if nodeInfo.Protocol.EncryptionServerPadding != "" {
-				parts = append(parts, nodeInfo.Protocol.EncryptionServerPadding)
-			}
-			parts = append(parts, nodeInfo.Protocol.EncryptionPrivateKey)
-			decryption = strings.Join(parts, ".")
-		default:
-			return fmt.Errorf("vless decryption method %s is not support", nodeInfo.Protocol.Encryption)
-		}
+	decryption, err := vlessDecryption(nodeInfo.Protocol)
+	if err != nil {
+		return err
 	}
 	s, err := json.Marshal(&coreConf.VLessInboundConfig{
 		Decryption: decryption,
@@ -284,6 +270,43 @@ func buildVLess(nodeInfo *panel.NodeInfo, inbound *coreConf.InboundDetourConfig)
 	inbound.Settings = (*json.RawMessage)(&s)
 	inbound.StreamSetting, err = buildStreamSetting(nodeInfo.Protocol)
 	return err
+}
+
+// defaultVLESSTicket 0-RTT 未填票据时间时使用的有效期（秒）
+const defaultVLESSTicket = "600"
+
+// vlessDecryption 按 Xray 格式拼服务端 decryption：
+// mlkem768x25519plus.<模式>.<票据秒数>s[.<填充>].<私钥>
+// 1-RTT 的票据段固定为 0s；0-RTT 取面板票据时间，兼容带或不带 s 后缀，留空用默认值。
+func vlessDecryption(p *panel.Protocol) (string, error) {
+	switch p.Encryption {
+	case "", "none":
+		return "none", nil
+	case "mlkem768x25519plus":
+	default:
+		return "", fmt.Errorf("vless decryption method %s is not support", p.Encryption)
+	}
+	mode := strings.TrimSpace(p.EncryptionMode)
+	if mode == "" {
+		return "", fmt.Errorf("vless encryption mode is empty")
+	}
+	privateKey := strings.TrimSpace(p.EncryptionPrivateKey)
+	if privateKey == "" {
+		return "", fmt.Errorf("vless encryption private key is empty, generate a key pair in the panel")
+	}
+	ticket := "0"
+	if strings.TrimSpace(p.EncryptionRTT) == "0rtt" {
+		ticket = strings.TrimSuffix(strings.TrimSpace(p.EncryptionTicket), "s")
+		if ticket == "" {
+			ticket = defaultVLESSTicket
+		}
+	}
+	parts := []string{"mlkem768x25519plus", mode, ticket + "s"}
+	if padding := strings.TrimSpace(p.EncryptionServerPadding); padding != "" {
+		parts = append(parts, padding)
+	}
+	parts = append(parts, privateKey)
+	return strings.Join(parts, "."), nil
 }
 
 func buildVMess(nodeInfo *panel.NodeInfo, inbound *coreConf.InboundDetourConfig) error {
