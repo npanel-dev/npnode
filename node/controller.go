@@ -20,16 +20,16 @@ type Controller struct {
 	// syncVersion 已应用的推送版本，0 表示推送未就绪（未收到全量或流已断开）
 	syncVersion uint64
 	// lastFullSync 推送模式下最近一次全量（推送全量或拉取校对）的时间
-	lastFullSync            time.Time
-	server                  *vCore.XrayCore
-	apiClient               *panel.ClientV1
-	grpcClient              *panel.GrpcClient
-	tag                     string
-	limiter                 *limiter.Limiter
-	userList                []panel.UserInfo
+	lastFullSync time.Time
+	server       *vCore.XrayCore
+	apiClient    *panel.ClientV1
+	grpcClient   *panel.GrpcClient
+	tag          string
+	limiter      *limiter.Limiter
+	userList     []panel.UserInfo
 	// rejected 本入站加入失败过的条目（键 rejectKey：id + uuid + 参数），同一内容再失败不重复告警（U3 ④）。
 	// 内容变化（键变了）或面板移除该条目时清掉；受 userMu 保护
-	rejected map[string]struct{}
+	rejected                map[string]struct{}
 	aliveMap                map[int]int
 	info                    *panel.NodeInfo
 	traffic                 *trafficQueue
