@@ -13,8 +13,10 @@ import (
 	coreConf "github.com/xtls/xray-core/infra/conf"
 )
 
-// SOCKS / HTTP 入站。Xray 的这两种入站不能在运行中增删用户（没有 UserManager），
-// 所以本机记下每个入站的用户集合，用户变化时用全部账号整个重建入站（已连接的会话会断开重连）。
+// SOCKS / HTTP 入站。Xray 的这两种入站不能在运行中增删用户（没有 UserManager，账号表是配置里不加锁的 map，
+// 运行中改写会与握手时的读取竞争），所以本机记下每个入站的用户集合，账号集合实际变化时用全部账号整个重建入站。
+// 重建只替换监听：已建立的 TCP 会话不受影响（见 TestPlainProxyRebuildKeepsOtherUsersConnections），
+// 但重建期间监听短暂关闭，SOCKS 的 UDP 会话会中断；集合没有变化时不重建。
 // 账号：用户名和密码都是用户 UUID；会话 email 在 dispatcher 里统一成“入站标签|UUID”。
 
 func isPlainProxy(protocolType string) bool {
@@ -124,6 +126,10 @@ func (v *XrayCore) addPlainProxyUsers(p *AddUsersParams) ([]panel.UserInfo, erro
 		added = append(added, u)
 	}
 	v.users.mapLock.Unlock()
+	if len(added) == 0 {
+		// 账号集合没变：不重建（无效条目每轮同步都会被静默重试，不能每次都整表重建）
+		return added, nil
+	}
 	if err := v.rebuildPlainProxy(p.Tag); err != nil {
 		v.users.mapLock.Lock()
 		for _, u := range added {
@@ -145,13 +151,21 @@ func (v *XrayCore) delPlainProxyUsers(users []panel.UserInfo, tag string) ([]pan
 		return nil, fmt.Errorf("no plain proxy inbound %s", tag)
 	}
 	v.users.mapLock.Lock()
+	changed := false
 	for i := range users {
 		user := format.UserTag(tag, users[i].Uuid)
+		if ib.users[users[i].Uuid] {
+			changed = true
+		}
 		delete(ib.users, users[i].Uuid)
 		v.closeUserLinksLocked(user)
 		v.retireUserCounterLocked(tag, user)
 	}
 	v.users.mapLock.Unlock()
+	if !changed {
+		// 要删的账号本来就不在集合里（与 UserManager 的 not found 一样按已移除处理）：集合没变，不重建
+		return users, nil
+	}
 	// 重建失败时入站已不可用（旧入站已移除），这些用户也不在内核里了，仍按已移除处理
 	return users, v.rebuildPlainProxy(tag)
 }
