@@ -32,6 +32,9 @@ type ServerApiConfig struct {
 	ServerId  int    `mapstructure:"ServerID"`
 	SecretKey string `mapstructure:"SecretKey"`
 	Timeout   int    `mapstructure:"Timeout"`
+	// SeatV1 向面板声明 seat_v1（设备名额）：限速按 bit/s 解释、接收 Sync 分片推送。
+	// 默认关闭，与旧版行为一致；面板升级到支持设备名额后再逐台打开。
+	SeatV1 bool `mapstructure:"SeatV1"`
 }
 
 type NodeApiConfig struct {

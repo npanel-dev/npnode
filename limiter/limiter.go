@@ -26,10 +26,13 @@ type Limiter struct {
 	UserLimitInfo *sync.Map      // Key: TagUUID, value: UserLimitInfo
 	SpeedLimiter  *sync.Map      // key: TagUUID, value: *ratelimit.Bucket
 	AliveList     map[int]int    // Key: Uid, value: alive_ip
+	// BitPerSecond 声明了 seat_v1：speed_limit 按 bit/s 解释；否则按旧口径 Mbps 解释
+	BitPerSecond bool
 }
 
 type UserLimitInfo struct {
-	UID               int
+	UID int
+	// SpeedLimit 面板下发的限速：声明 seat_v1 时单位为 bit/s，否则为旧口径 Mbps；0 表示不限
 	SpeedLimit        int
 	DeviceLimit       int
 	DynamicSpeedLimit int
@@ -44,6 +47,7 @@ func AddLimiter(tag string, users []panel.UserInfo, aliveList map[int]int) *Limi
 		SpeedLimiter:  new(sync.Map),
 		AliveList:     aliveList,
 		OldUserOnline: new(sync.Map),
+		BitPerSecond:  panel.SeatV1Enabled(),
 	}
 	uuidmap := make(map[string]int)
 	for i := range users {
@@ -165,7 +169,7 @@ func (l *Limiter) CheckLimit(taguuid string, ip string, isTcp bool, noSSUDP bool
 		}
 	}
 
-	limit := int64(determineSpeedLimit(nodeLimit, userLimit)) * 1000000 / 8 // If you need the Speed limit
+	limit := speedLimitBytesPerSecond(determineSpeedLimit(nodeLimit, userLimit), l.BitPerSecond)
 	if limit > 0 {
 		Bucket = ratelimit.NewBucketWithQuantum(time.Second, limit, limit) // Byte/s
 		if v, ok := l.SpeedLimiter.LoadOrStore(taguuid, Bucket); ok {
@@ -177,6 +181,23 @@ func (l *Limiter) CheckLimit(taguuid string, ip string, isTcp bool, noSSUDP bool
 	} else {
 		return nil, false
 	}
+}
+
+// speedLimitBytesPerSecond 把面板限速换算成字节每秒，0 表示不限。
+// bitPerSecond（seat_v1）：字节每秒 = speed_limit / 8，不做任何启发式换算；不足 1 字节每秒按 1 处理，不能当成不限。
+// 否则保持旧口径：按 Mbps 解释（× 1000000 / 8）。
+func speedLimitBytesPerSecond(speedLimit int, bitPerSecond bool) int64 {
+	if !bitPerSecond {
+		return int64(speedLimit) * 1000000 / 8
+	}
+	if speedLimit <= 0 {
+		return 0
+	}
+	limit := int64(speedLimit) / 8
+	if limit == 0 {
+		limit = 1
+	}
+	return limit
 }
 
 func (l *Limiter) GetOnlineDevice() (*[]panel.OnlineUser, error) {

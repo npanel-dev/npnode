@@ -86,6 +86,9 @@ func parseGrpcAddr(raw string) (addr string, useTLS bool) {
 	return host, u.Scheme == "https"
 }
 
+// grpcMaxRecvMsgSize gRPC 接收上限（10 万条用户约 5.5 MB）
+const grpcMaxRecvMsgSize = 64 << 20
+
 // NewGrpcClient creates a new gRPC client connected to the panel server.
 func NewGrpcClient(cfg *conf.GrpcConfig, secretKey string, serverID int) (*GrpcClient, error) {
 	addr, useTLS := parseGrpcAddr(cfg.Addr)
@@ -114,6 +117,8 @@ func NewGrpcClient(cfg *conf.GrpcConfig, secretKey string, serverID int) (*GrpcC
 			Timeout:             10 * time.Second,
 			PermitWithoutStream: true,
 		}),
+		// 一元 GetUserList 不分片，名额条目会让列表超过默认 4 MB 接收上限
+		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(grpcMaxRecvMsgSize)),
 	}
 
 	conn, err := grpc.NewClient(addr, opts...)
@@ -153,9 +158,10 @@ func (g *GrpcClient) Close() error {
 func (g *GrpcClient) GetConfig(ctx context.Context, protocols []string) (*nodev1.GetConfigResponse, error) {
 	ctx = g.authContext(ctx)
 	resp, err := g.client.GetConfig(ctx, &nodev1.GetConfigRequest{
-		ServerId:  g.serverID,
-		SecretKey: g.secretKey,
-		Protocols: protocols,
+		ServerId:     g.serverID,
+		SecretKey:    g.secretKey,
+		Protocols:    protocols,
+		Capabilities: CapabilityList(),
 	})
 	if err != nil {
 		st := status.Convert(err)
@@ -169,9 +175,10 @@ func (g *GrpcClient) GetConfig(ctx context.Context, protocols []string) (*nodev1
 func (g *GrpcClient) GetUserList(ctx context.Context, protocol string, port int) ([]UserInfo, error) {
 	ctx = g.authContext(ctx)
 	req := &nodev1.GetUserListRequest{
-		ServerId:  g.serverID,
-		SecretKey: g.secretKey,
-		Protocol:  protocol,
+		ServerId:     g.serverID,
+		SecretKey:    g.secretKey,
+		Protocol:     protocol,
+		Capabilities: CapabilityList(),
 	}
 	if port > 0 && port <= 65535 {
 		req.Port = uint32(port)
@@ -243,6 +250,12 @@ type SyncHandler interface {
 	OnSyncDisconnected()
 }
 
+// UserUpdateLossHandler 可选：某个入站的分片推送没有收齐（缺片、被打断、超时）时通知，
+// 实现方应作废该入站的本地推送版本并重新订阅取全量。
+type UserUpdateLossHandler interface {
+	OnUserUpdateLost(protocol string, port int)
+}
+
 // Inbound 一个入站（协议 + 端口）
 type Inbound struct {
 	Protocol string
@@ -281,7 +294,8 @@ func (g *GrpcClient) Subscribe(inbounds ...Inbound) error {
 	}
 	sub := &nodev1.Subscribe{}
 	for _, in := range inbounds {
-		sub.Inbounds = append(sub.Inbounds, &nodev1.Inbound{Protocol: in.Protocol, Port: clampPort(in.Port)})
+		// 每个入站都带能力：面板按能力把会话分到不同推送通道（重新订阅时同样要带）
+		sub.Inbounds = append(sub.Inbounds, &nodev1.Inbound{Protocol: in.Protocol, Port: clampPort(in.Port), Capabilities: CapabilityList()})
 	}
 	return g.sendSync(&nodev1.SyncRequest{Payload: &nodev1.SyncRequest_Subscribe{Subscribe: sub}})
 }
@@ -497,6 +511,17 @@ func (g *GrpcClient) runSyncLoop(handler SyncHandler, done <-chan struct{}) {
 
 		log.Info("[grpc.Sync] stream opened")
 
+		// 每条流单独重组分片：流断开后未收齐的分片作废，重连后面板会重新推送全量
+		assembler := newChunkAssembler(func(u UserUpdate) {
+			if handler != nil {
+				handler.OnUserUpdate(u)
+			}
+		}, func(protocol string, port int) {
+			if lh, ok := handler.(UserUpdateLossHandler); ok {
+				lh.OnUserUpdateLost(protocol, port)
+			}
+		}, chunkAssembleTimeout)
+
 		// Heartbeat: send keepalive Status every 30s to prevent Cloudflare 524 timeout
 		streamDone := make(chan struct{})
 		go g.syncHeartbeat(stream, streamDone)
@@ -530,15 +555,8 @@ func (g *GrpcClient) runSyncLoop(handler SyncHandler, done <-chan struct{}) {
 			switch payload := resp.Payload.(type) {
 			case *nodev1.SyncResponse_UserUpdate:
 				if handler != nil {
-					u := payload.UserUpdate
-					handler.OnUserUpdate(UserUpdate{
-						Protocol: u.GetProtocol(),
-						Port:     int(u.GetPort()),
-						Version:  u.GetVersion(),
-						Action:   u.GetAction(),
-						Users:    userEntriesToInfo(u.GetUsers()),
-						Removed:  userEntriesToInfo(u.GetRemoved()),
-					})
+					// 分片收齐后才交给 handler；没有分片的推送原样分发
+					assembler.handle(payload.UserUpdate)
 				}
 			case *nodev1.SyncResponse_ConfigUpdate:
 				if handler != nil {
@@ -559,6 +577,7 @@ func (g *GrpcClient) runSyncLoop(handler SyncHandler, done <-chan struct{}) {
 
 		close(streamDone)
 		markReady.Stop()
+		assembler.reset()
 
 		g.mu.Lock()
 		streamActive = false
@@ -628,6 +647,9 @@ func (g *GrpcClient) authContext(ctx context.Context) context.Context {
 		"secret-key", g.secretKey,
 		"server-id", fmt.Sprintf("%d", g.serverID),
 	)
+	if agent := NodeAgent(); agent != "" {
+		md.Set("x-node-agent", agent)
+	}
 	return metadata.NewOutgoingContext(ctx, md)
 }
 

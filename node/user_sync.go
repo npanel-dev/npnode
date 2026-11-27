@@ -25,32 +25,39 @@ func (c *Controller) pushHealthyLocked() bool {
 }
 
 // applyUserSetLocked 把内核用户同步成 users（全量）。调用方持有 userMu。
+// 返回实际新增、删除的数量；单条失败的用户不计入，下一轮会重试。
 func (c *Controller) applyUserSetLocked(users []panel.UserInfo) (added, deleted int, err error) {
 	del, add := compareUserList(c.userList, users)
-	if err := c.applyChangesLocked(del, add); err != nil {
-		return 0, 0, err
-	}
-	return len(add), len(del), nil
+	return c.applyChangesLocked(del, add)
 }
 
 // applyChangesLocked 先删后加，并保证 c.userList 始终与内核实际状态一致：
-// 删除成功而新增失败时，列表里也要去掉已删除的用户，否则下一轮会反复删除不存在的用户。
-func (c *Controller) applyChangesLocked(deleted, added []panel.UserInfo) error {
+// 只把内核里实际移除、实际加入的用户移出 / 并入 c.userList 和限速器。
+// 单条失败只跳过（内核已记日志），失败的用户不记入本地，下一轮同步会重试，也不会反复 already exists；
+// 只有整个入站不可用时才返回错误。
+func (c *Controller) applyChangesLocked(deleted, added []panel.UserInfo) (addedN, deletedN int, err error) {
 	if len(deleted) > 0 {
-		if err := c.server.DelUsers(deleted, c.tag, c.info); err != nil {
-			return err
+		removed, err := c.server.DelUsers(deleted, c.tag, c.info)
+		c.userList = removeUsers(c.userList, removed)
+		c.limiter.UpdateUser(c.tag, nil, removed)
+		deletedN = len(removed)
+		if err != nil {
+			if len(removed) == 0 {
+				return 0, 0, err
+			}
+			log.WithFields(log.Fields{"tag": c.tag, "err": err}).Warn("部分用户移除失败，保留到下一轮重试")
 		}
-		c.userList = removeUsers(c.userList, deleted)
-		c.limiter.UpdateUser(c.tag, nil, deleted)
 	}
 	if len(added) > 0 {
-		if _, err := c.server.AddUsers(&vCore.AddUsersParams{Tag: c.tag, NodeInfo: c.info, Users: added}); err != nil {
-			return err
+		ok, err := c.server.AddUsers(&vCore.AddUsersParams{Tag: c.tag, NodeInfo: c.info, Users: added})
+		if err != nil {
+			return 0, deletedN, err
 		}
-		c.userList = append(c.userList, added...)
-		c.limiter.UpdateUser(c.tag, added, nil)
+		c.userList = append(c.userList, ok...)
+		c.limiter.UpdateUser(c.tag, ok, nil)
+		addedN = len(ok)
 	}
-	return nil
+	return addedN, deletedN, nil
 }
 
 func removeUsers(list, remove []panel.UserInfo) []panel.UserInfo {
@@ -119,7 +126,8 @@ func (c *Controller) ApplyUserUpdate(u panel.UserUpdate) {
 				present[userSyncKey(x)] = true
 			}
 		}
-		if err := c.applyChangesLocked(deleted, added); err != nil {
+		addedN, deletedN, err := c.applyChangesLocked(deleted, added)
+		if err != nil {
 			c.syncVersion = 0
 			c.userMu.Unlock()
 			log.WithFields(log.Fields{"tag": c.tag, "err": err}).Error("应用推送差异失败，重新订阅取全量")
@@ -128,7 +136,7 @@ func (c *Controller) ApplyUserUpdate(u panel.UserUpdate) {
 		}
 		c.syncVersion = u.Version
 		c.userMu.Unlock()
-		log.WithField("节点", c.tag).Infof("收到推送 v%d：删除 %d 个、新增 %d 个用户", u.Version, len(deleted), len(added))
+		log.WithField("节点", c.tag).Infof("收到推送 v%d：删除 %d 个、新增 %d 个用户", u.Version, deletedN, addedN)
 
 	default:
 		c.userMu.Unlock()
@@ -160,6 +168,19 @@ func (n *Node) OnUserUpdate(u panel.UserUpdate) {
 		}
 		if c.info.Type == u.Protocol && c.info.Protocol.Port == u.Port {
 			c.ApplyUserUpdate(u)
+		}
+	}
+}
+
+// OnUserUpdateLost 某个入站的分片推送没有收齐：已有部分不能应用，作废本地版本并重新订阅取全量
+func (n *Node) OnUserUpdateLost(protocol string, port int) {
+	for _, c := range n.controllers {
+		if c == nil || c.grpcClient == nil || !c.info.Protocol.Enable {
+			continue
+		}
+		if c.info.Type == protocol && c.info.Protocol.Port == port {
+			c.resetSync()
+			c.resubscribe()
 		}
 	}
 }

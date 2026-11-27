@@ -27,6 +27,8 @@ message GetConfigRequest {
   int64 server_id = 1;
   string secret_key = 2;
   repeated string protocols = 3; // optional filter: only return these protocols
+  // 节点声明的能力（seat_v1 / online_v1 / admission_v1），未知值忽略
+  repeated string capabilities = 4;
 }
 
 message GetConfigResponse {
@@ -40,6 +42,10 @@ message GetConfigResponse {
   // 节点拉取配置/用户列表、上报流量的间隔（秒），0 时节点使用默认值。
   int64 pull_interval = 8;
   int64 push_interval = 9;
+  // 设备准入开关：节点声明了任意能力时为 false（由节点自行判断准入），否则为后台原值
+  bool device_admission_enabled = 10;
+  // 设备计数模式，一律为后台原值
+  string device_count_mode = 11;
 }
 
 message NodeDNS {
@@ -128,6 +134,8 @@ message GetUserListRequest {
   string protocol = 3;
   // 入站端口：同一服务器同协议可能有多个端口，用户列表按端口区分。0 表示不区分。
   uint32 port = 4;
+  // 节点声明的能力，决定用户条目的渲染口径
+  repeated string capabilities = 5;
 }
 
 message GetUserListResponse {
@@ -174,6 +182,8 @@ message Subscribe {
 message Inbound {
   string protocol = 1;
   uint32 port = 2;
+  // 订阅该入站的会话声明的能力：能力不同的会话属于不同的推送通道
+  repeated string capabilities = 3;
 }
 
 message TrafficReport {
@@ -252,6 +262,9 @@ message UserListUpdate {
   uint64 version = 5;
   // DIFF：被删除或变更前的用户
   repeated UserEntry removed = 6;
+  // 分片序号（从 1 开始）与总片数，只对声明了 seat_v1 的通道设置
+  uint32 chunk_no = 7;
+  uint32 chunk_total = 8;
 }
 
 enum UserUpdateAction {

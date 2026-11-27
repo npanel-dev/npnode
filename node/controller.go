@@ -115,10 +115,31 @@ func (c *Controller) Start() error {
 	if err != nil {
 		return fmt.Errorf("add users error: %s", err)
 	}
-	log.WithField("节点", c.tag).Infof("已添加 %d 个新用户", added)
+	// 单条失败只跳过（内核已记日志）：本地只记实际加入的用户，下一轮同步重试其余的
+	if len(added) != len(c.userList) {
+		c.syncLimiterAfterPartialAdd(added)
+		c.userList = added
+	}
+	log.WithField("节点", c.tag).Infof("已添加 %d 个新用户", len(added))
 	c.startTasks(c.info)
 	c.started = true
 	return nil
+}
+
+// syncLimiterAfterPartialAdd 限速器按完整列表建立，启动时有用户没加进内核：移除这些用户，再按实际加入的用户重写
+// （同一 uuid 重复时，被跳过的那条可能覆盖了实际加入那条的限速信息）
+func (c *Controller) syncLimiterAfterPartialAdd(added []panel.UserInfo) {
+	ok := make(map[string]struct{}, len(added))
+	for _, u := range added {
+		ok[u.Uuid] = struct{}{}
+	}
+	var dropped []panel.UserInfo
+	for _, u := range c.userList {
+		if _, in := ok[u.Uuid]; !in {
+			dropped = append(dropped, u)
+		}
+	}
+	c.limiter.UpdateUser(c.tag, added, dropped)
 }
 
 // Close implement the Close() function of the service interface
