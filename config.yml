@@ -12,6 +12,9 @@ Api:
   # 接收面板的分片推送，请求带 capabilities=seat_v1 与 X-Node-Agent。
   # 面板升级到支持设备名额的版本后再逐台打开；出问题改回 false 即恢复旧行为。
   SeatV1: false
+  # 声明 online_v1：在线上报改为基于活跃连接（长连接、空闲连接每个周期都上报），上报周期不超过 60 秒，
+  # 面板据此把本节点的在线数据用于名额并发冲突检测。与 SeatV1 相互独立；关闭时在线上报与旧版一致。
+  OnlineV1: false
 
 Grpc:
   # 默认开启：用 gRPC 推送用户和配置变更、上报流量。Addr 留空时从 Api.ApiHost 推出（同一个域名）。

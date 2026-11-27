@@ -35,6 +35,9 @@ type ServerApiConfig struct {
 	// SeatV1 向面板声明 seat_v1（设备名额）：限速按 bit/s 解释、接收 Sync 分片推送。
 	// 默认关闭，与旧版行为一致；面板升级到支持设备名额后再逐台打开。
 	SeatV1 bool `mapstructure:"SeatV1"`
+	// OnlineV1 向面板声明 online_v1：在线上报改为基于活跃连接（长连接、空闲连接也上报），周期不超过 60 秒。
+	// 默认关闭，在线上报的内容与时机与旧版一致；与 SeatV1 相互独立。
+	OnlineV1 bool `mapstructure:"OnlineV1"`
 }
 
 type NodeApiConfig struct {
