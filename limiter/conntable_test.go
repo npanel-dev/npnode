@@ -229,3 +229,20 @@ func TestLimiterOnlineActiveConnections(t *testing.T) {
 	}
 	r2()
 }
+
+// 上报失败时把本周期的结果放回：建立又关闭的短连接下一周期还能报出去（审查 M3）
+func TestConnTableRestoreAfterFailedReport(t *testing.T) {
+	ct := NewConnTable()
+	ct.Open(7, "198.51.100.1")()
+	long := ct.Open(8, "198.51.100.2")
+	failed := ct.Snapshot(64)
+	ct.Restore(failed)
+	want := []panel.OnlineUser{{UID: 7, IP: "198.51.100.1"}, {UID: 8, IP: "198.51.100.2"}}
+	if got := ct.Snapshot(64); !reflect.DeepEqual(got, want) {
+		t.Fatalf("after restore snapshot = %v, want %v", got, want)
+	}
+	if got := ct.Snapshot(64); !reflect.DeepEqual(got, want[1:]) {
+		t.Fatalf("restored short connection reported twice: %v", got)
+	}
+	long()
+}

@@ -251,6 +251,13 @@ func (l *Limiter) GetOnlineDevice() (*[]panel.OnlineUser, error) {
 	return legacy, nil
 }
 
+// RestoreOnline 在线上报失败：online_v1 口径下把这次读出的结果放回活跃连接表，下一周期补报；旧口径不做任何事（与旧版一致）
+func (l *Limiter) RestoreOnline(users []panel.OnlineUser) {
+	if l.Conns != nil {
+		l.Conns.Restore(users)
+	}
+}
+
 func (l *Limiter) drainLegacyOnline() *[]panel.OnlineUser {
 	var onlineUser []panel.OnlineUser
 	l.UserOnlineIP.Range(func(key, value interface{}) bool {

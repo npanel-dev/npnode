@@ -118,6 +118,22 @@ func (t *ConnTable) Snapshot(maxPerUID int) []panel.OnlineUser {
 	return out
 }
 
+// Restore 上报失败时把这次 Snapshot 的结果放回：重新标记为本周期出现过，下一次 Snapshot 再报（审查 M3）。
+// 已无活跃链路的条目重新建出来（计数为 0），报出后照常删除
+func (t *ConnTable) Restore(users []panel.OnlineUser) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for _, u := range users {
+		k := connKey{uid: u.UID, ip: u.IP}
+		e := t.m[k]
+		if e == nil {
+			e = &connEntry{}
+			t.m[k] = e
+		}
+		e.seen = true
+	}
+}
+
 // Len 表内条目数（含计数归零、等待下一次上报的条目），供测试和排查
 func (t *ConnTable) Len() int {
 	t.mu.Lock()

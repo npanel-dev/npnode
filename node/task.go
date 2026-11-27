@@ -239,6 +239,8 @@ func (c *Controller) reportOnlineUsers(ctx context.Context, useSync bool, filter
 	}
 	if err != nil {
 		log.WithFields(log.Fields{"tag": c.tag, "err": err}).Info("Report online users failed")
+		// online_v1：本周期的短连接放回，下一周期补报；旧口径下 RestoreOnline 不做任何事
+		c.limiter.RestoreOnline(result)
 	} else {
 		log.WithField("节点", c.tag).Infof("总计 %d 名在线用户, %d 名已上报", len(*onlineDevice), len(result))
 	}

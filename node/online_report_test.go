@@ -26,6 +26,7 @@ func TestOnlineReportIntervalCapsAt60s(t *testing.T) {
 type onlineRecorder struct {
 	mu     sync.Mutex
 	bodies []string
+	fail   bool
 }
 
 func newOnlineController(t *testing.T, online bool) (*Controller, *onlineRecorder, string) {
@@ -36,7 +37,12 @@ func newOnlineController(t *testing.T, online bool) (*Controller, *onlineRecorde
 			raw, _ := io.ReadAll(r.Body)
 			rec.mu.Lock()
 			rec.bodies = append(rec.bodies, string(raw))
+			fail := rec.fail
 			rec.mu.Unlock()
+			if fail {
+				_, _ = io.WriteString(w, `{"code":500,"msg":"Internal Server Error"}`)
+				return
+			}
 		}
 		_, _ = io.WriteString(w, `{"code":200,"msg":"success"}`)
 	}))
@@ -90,5 +96,25 @@ func TestOnlineStaysInTrafficTaskWhenOnlineV1Off(t *testing.T) {
 	c, _, _ := newOnlineController(t, false)
 	if !c.trafficTaskReportsOnline() {
 		t.Fatal("without online_v1 the traffic task must keep reporting online users")
+	}
+}
+
+// 上报失败时本周期的短连接不丢，下一周期补报（审查 M3）
+func TestOnlineTaskKeepsShortConnectionAfterFailedReport(t *testing.T) {
+	c, rec, tag := newOnlineController(t, true)
+	c.limiter.OpenConn(format.UserTag(tag, "u-45"), "203.0.113.9")()
+	rec.mu.Lock()
+	rec.fail = true
+	rec.mu.Unlock()
+	_ = c.reportOnlineUsersTask(context.Background())
+	rec.mu.Lock()
+	rec.fail = false
+	rec.mu.Unlock()
+	_ = c.reportOnlineUsersTask(context.Background())
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	want := `{"users":[{"uid":1000000045,"ip":"203.0.113.9"}]}`
+	if len(rec.bodies) != 2 || rec.bodies[1] != want {
+		t.Fatalf("reports = %v, want second report %s", rec.bodies, want)
 	}
 }
