@@ -117,7 +117,6 @@ func plainHandler(t *testing.T, vc *XrayCore, tag string) any {
 // 用户集合没有变化（全部无效、要删的本来就不在）时不重建入站：
 // 无效条目每轮同步都会被静默重试，10 万条时每次重建约 100～250 ms，且重建期间监听短暂关闭、UDP 会话中断
 func TestPlainProxySkipsRebuildWithoutChange(t *testing.T) {
-	limiter.Init()
 	info := &panel.NodeInfo{Id: 1, Type: "socks", Protocol: &panel.Protocol{Type: "socks", Port: freePort(t)}}
 	vc, tag := seatTestCore(t, info)
 	t.Cleanup(func() { _ = vc.DelNode(tag) })

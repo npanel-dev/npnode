@@ -16,7 +16,9 @@ var limitLock sync.RWMutex
 var limiter map[string]*Limiter
 
 func Init() {
+	limitLock.Lock()
 	limiter = map[string]*Limiter{}
+	limitLock.Unlock()
 	connTablesMu.Lock()
 	connTables = map[string]*ConnTable{}
 	connTablesMu.Unlock()
