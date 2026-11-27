@@ -148,6 +148,22 @@ func (*DefaultDispatcher) Start() error {
 // Close implements common.Closable.
 func (*DefaultDispatcher) Close() error { return nil }
 
+// trackOnlineLink 把通过限速检查的链路登记到活跃连接表（online_v1，O1），返回释放函数；未声明时返回 nil。
+// 释放有三个触发点，谁先到谁生效：入站关闭写端（ManagedWriter.Close）、用户被移除（LinkManager.CloseAll）、
+// 连接上下文结束（入站处理返回时 xray 取消上下文；入站出错时只 Interrupt 不 Close 的路径靠它兜底）。
+// 所有协议（含 UDP 类、SOCKS / HTTP 入站）的用户链路都经过 getLink 或 DispatchLink，在这里统一登记。
+func trackOnlineLink(ctx context.Context, limit *limiter.Limiter, email, ip string) func() {
+	release := limit.OpenConn(email, ip)
+	if release == nil {
+		return nil
+	}
+	stop := context.AfterFunc(ctx, release)
+	return func() {
+		stop()
+		release()
+	}
+}
+
 func (d *DefaultDispatcher) getLink(ctx context.Context, network net.Network) (*transport.Link, *transport.Link, *limiter.Limiter, error) {
 	opt := pipe.OptionsFromContext(ctx)
 	uplinkReader, uplinkWriter := pipe.New(opt...)
@@ -207,6 +223,7 @@ func (d *DefaultDispatcher) getLink(ctx context.Context, network net.Network) (*
 		managedWriter := &ManagedWriter{
 			writer:  uplinkWriter,
 			manager: lm,
+			release: trackOnlineLink(ctx, limit, user.Email, sessionInbound.Source.Address.IP().String()),
 		}
 		lm.AddLink(managedWriter, outboundLink.Reader)
 		inboundLink.Writer = managedWriter
@@ -390,6 +407,7 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 		managedWriter := &ManagedWriter{
 			writer:  outbound.Writer,
 			manager: lm,
+			release: trackOnlineLink(ctx, limit, user.Email, sessionInbound.Source.Address.IP().String()),
 		}
 		outbound.Writer = managedWriter
 		if w != nil {

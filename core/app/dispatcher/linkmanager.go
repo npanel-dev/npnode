@@ -10,6 +10,15 @@ import (
 type ManagedWriter struct {
 	writer  buf.Writer
 	manager *LinkManager
+	// release 活跃连接表（online_v1）的释放函数，nil 表示未登记。可重复调用，只生效一次
+	release func()
+}
+
+// releaseOnline 从活跃连接表注销这条链路
+func (w *ManagedWriter) releaseOnline() {
+	if w.release != nil {
+		w.release()
+	}
 }
 
 func (w *ManagedWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
@@ -18,6 +27,7 @@ func (w *ManagedWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 
 func (w *ManagedWriter) Close() error {
 	w.manager.RemoveWriter(w)
+	w.releaseOnline()
 	return common.Close(w.writer)
 }
 
@@ -60,5 +70,6 @@ func (m *LinkManager) CloseAll() {
 	for w, r := range links {
 		common.Close(w.writer)
 		common.Interrupt(r)
+		w.releaseOnline()
 	}
 }
