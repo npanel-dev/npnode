@@ -150,12 +150,18 @@ func (*DefaultDispatcher) Close() error { return nil }
 
 // trackOnlineLink 把通过限速检查的链路登记到活跃连接表（online_v1，O1），返回释放函数；未声明时返回 nil。
 // 释放有三个触发点，谁先到谁生效：入站关闭写端（ManagedWriter.Close）、用户被移除（LinkManager.CloseAll）、
-// 连接上下文结束（入站处理返回时 xray 取消上下文；入站出错时只 Interrupt 不 Close 的路径靠它兜底）。
+// 连接上下文结束（入站处理返回时 xray 取消上下文；入站出错时只 Interrupt 不 Close 的路径靠它兜底；
+// XUDP 的 TimeoutOnly 上下文除外）。没有子会话的空闲 mux 承载连接不经过这里，不算在线。
 // 所有协议（含 UDP 类、SOCKS / HTTP 入站）的用户链路都经过 getLink 或 DispatchLink，在这里统一登记。
 func trackOnlineLink(ctx context.Context, limit *limiter.Limiter, email, ip string) func() {
 	release := limit.OpenConn(email, ip)
 	if release == nil {
 		return nil
+	}
+	if session.TimeoutOnlyFromContext(ctx) {
+		// XUDP：链路可能被迁移到新的 mux 连接继续转发，原连接上下文结束不代表链路结束；
+		// 只靠 Close / CloseAll 释放（XUDP 过期清理会 Interrupt 链路，最终走到 ManagedWriter.Close）
+		return release
 	}
 	stop := context.AfterFunc(ctx, release)
 	return func() {
