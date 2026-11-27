@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/npanel-dev/npnode/api/panel"
+	"github.com/npanel-dev/npnode/common/counter"
 	"github.com/npanel-dev/npnode/common/task"
 	"github.com/npanel-dev/npnode/conf"
 	"github.com/npanel-dev/npnode/core/app/dispatcher"
@@ -45,8 +46,16 @@ type XrayCore struct {
 }
 
 type UserMap struct {
-	uidMap  map[string]int
+	uidMap map[string]int
+	// retired 已移除用户的计数器（按入站标签），下一次上报时读出并以原 id 上报（U2）
+	retired map[string][]retiredCounter
 	mapLock sync.RWMutex
+}
+
+// retiredCounter 已移除用户的计数器与原 id
+type retiredCounter struct {
+	uid     int
+	storage *counter.TrafficStorage
 }
 
 func New(config *conf.Conf, client *panel.ClientV2) *XrayCore {
@@ -54,7 +63,8 @@ func New(config *conf.Conf, client *panel.ClientV2) *XrayCore {
 		Config: config,
 		Client: client,
 		users: &UserMap{
-			uidMap: make(map[string]int),
+			uidMap:  make(map[string]int),
+			retired: make(map[string][]retiredCounter),
 		},
 	}
 	return core

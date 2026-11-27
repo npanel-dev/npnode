@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -11,6 +12,7 @@ import (
 	"github.com/npanel-dev/npnode/common/counter"
 	"github.com/npanel-dev/npnode/common/format"
 	"github.com/npanel-dev/npnode/core/app/dispatcher"
+	log "github.com/sirupsen/logrus"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/serial"
 	"github.com/xtls/xray-core/infra/conf"
@@ -42,43 +44,74 @@ func (v *XrayCore) GetUserManager(tag string) (proxy.UserManager, error) {
 	return userManager, nil
 }
 
-func (vc *XrayCore) DelUsers(users []panel.UserInfo, tag string, info *panel.NodeInfo) error {
+// DelUsers 逐条从内核移除用户，返回实际移除的用户（内核里本来就没有的也算已移除）。
+// 单条失败只记录并继续，失败的用户仍在内核里，调用方不应把它从本地记录中去掉。
+// 被移除用户尚未上报的流量（含连接关闭过程中仍在写入的字节）保留到下一次上报，以原 id 上报。
+func (vc *XrayCore) DelUsers(users []panel.UserInfo, tag string, info *panel.NodeInfo) ([]panel.UserInfo, error) {
 	if info != nil && isPlainProxy(info.Type) {
 		return vc.delPlainProxyUsers(users, tag)
 	}
 	userManager, err := vc.GetUserManager(tag)
 	if err != nil {
-		return fmt.Errorf("get user manager error: %s", err)
+		return nil, fmt.Errorf("get user manager error: %s", err)
 	}
-	var user string
 	vc.users.mapLock.Lock()
 	defer vc.users.mapLock.Unlock()
+	removed := make([]panel.UserInfo, 0, len(users))
+	var errs []error
 	for i := range users {
-		user = format.UserTag(tag, users[i].Uuid)
+		user := format.UserTag(tag, users[i].Uuid)
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		err = userManager.RemoveUser(ctx, user)
+		err := userManager.RemoveUser(ctx, user)
 		cancel()
-		if err != nil {
-			return err
+		if err != nil && !isUserNotFound(err) {
+			log.WithFields(log.Fields{"tag": tag, "uid": users[i].Id, "err": err}).Warn("从内核移除用户失败，跳过")
+			errs = append(errs, fmt.Errorf("remove user %d: %w", users[i].Id, err))
+			continue
 		}
-		delete(vc.users.uidMap, user)
-		if v, ok := vc.dispatcher.Counter.Load(tag); ok {
-			tc := v.(*counter.TrafficCounter)
-			tc.Delete(user)
-		}
-		if v, ok := vc.dispatcher.LinkManagers.Load(user); ok {
-			lm := v.(*dispatcher.LinkManager)
-			lm.CloseAll()
-			vc.dispatcher.LinkManagers.Delete(user)
-		}
+		vc.closeUserLinksLocked(user)
+		vc.retireUserCounterLocked(tag, user)
+		removed = append(removed, users[i])
 	}
-	return nil
+	return removed, errors.Join(errs...)
 }
 
+// isUserNotFound 内核里没有这个用户（各协议的 UserManager 报错文本不同，统一按 not found 判断）
+func isUserNotFound(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "not found")
+}
+
+// closeUserLinksLocked 断开用户的全部连接（调用方持有 users.mapLock）
+func (vc *XrayCore) closeUserLinksLocked(user string) {
+	if v, ok := vc.dispatcher.LinkManagers.Load(user); ok {
+		v.(*dispatcher.LinkManager).CloseAll()
+		vc.dispatcher.LinkManagers.Delete(user)
+	}
+}
+
+// retireUserCounterLocked 用户被移除：计数器移出计数表，但连同 uid 留到下一次上报时读出（调用方持有 users.mapLock）。
+// 连接持有计数器指针，关闭过程中仍可能写入，所以不在这里清零，而是在上报时一次读出。
+func (vc *XrayCore) retireUserCounterLocked(tag, user string) {
+	uid := vc.users.uidMap[user]
+	delete(vc.users.uidMap, user)
+	v, ok := vc.dispatcher.Counter.Load(tag)
+	if !ok {
+		return
+	}
+	tc := v.(*counter.TrafficCounter)
+	if storage, ok := tc.Counters.Load(user); ok {
+		if uid > 0 {
+			vc.users.retired[tag] = append(vc.users.retired[tag], retiredCounter{uid: uid, storage: storage.(*counter.TrafficStorage)})
+		}
+		tc.Delete(user)
+	}
+}
+
+// GetUserTrafficSlice 读出并清零各用户流量。已移除用户的残留流量不受上报阈值限制，读出后按原 id 合并上报。
 func (vc *XrayCore) GetUserTrafficSlice(tag string, mintraffic int) ([]panel.UserTraffic, error) {
 	trafficSlice := make([]panel.UserTraffic, 0)
-	vc.users.mapLock.RLock()
-	defer vc.users.mapLock.RUnlock()
+	vc.users.mapLock.Lock()
+	defer vc.users.mapLock.Unlock()
 	if v, ok := vc.dispatcher.Counter.Load(tag); ok {
 		c := v.(*counter.TrafficCounter)
 		c.Counters.Range(func(key, value interface{}) bool {
@@ -102,70 +135,151 @@ func (vc *XrayCore) GetUserTrafficSlice(tag string, mintraffic int) ([]panel.Use
 			}
 			return true
 		})
-		if len(trafficSlice) == 0 {
-			return nil, nil
-		}
-		return trafficSlice, nil
 	}
-	return nil, nil
+	if retired := vc.users.retired[tag]; len(retired) > 0 {
+		delete(vc.users.retired, tag)
+		trafficSlice = mergeRetiredTraffic(trafficSlice, retired)
+	}
+	if len(trafficSlice) == 0 {
+		return nil, nil
+	}
+	return trafficSlice, nil
 }
 
-func (v *XrayCore) AddUsers(p *AddUsersParams) (added int, err error) {
+// mergeRetiredTraffic 把已移除用户的残留流量并入本次上报；同一 id（如先删后加、重置名额换 uuid）合并为一条
+func mergeRetiredTraffic(traffic []panel.UserTraffic, retired []retiredCounter) []panel.UserTraffic {
+	index := make(map[int]int, len(traffic))
+	for i, t := range traffic {
+		index[t.UID] = i
+	}
+	for _, r := range retired {
+		up := r.storage.UpCounter.Swap(0)
+		down := r.storage.DownCounter.Swap(0)
+		if up+down == 0 {
+			continue
+		}
+		if i, ok := index[r.uid]; ok {
+			traffic[i].Upload += up
+			traffic[i].Download += down
+			continue
+		}
+		index[r.uid] = len(traffic)
+		traffic = append(traffic, panel.UserTraffic{UID: r.uid, Upload: up, Download: down})
+	}
+	return traffic
+}
+
+// AddUsers 逐条把用户加入内核，返回实际加入的用户。
+// 单条无效（id<=0、uuid 为空、同批 uuid 重复、已在本地记录中、SS2022 uuid 长度不足）或内核拒绝时只跳过这一条并记日志，
+// 其余照常加入；只为加入成功的用户记录 uid，失败的不记入，下一轮同步会重试。
+// 只有整个入站不可用（找不到入站、协议不支持）时才返回错误。
+func (v *XrayCore) AddUsers(p *AddUsersParams) (added []panel.UserInfo, err error) {
 	if p.NodeInfo != nil && isPlainProxy(p.NodeInfo.Type) {
 		return v.addPlainProxyUsers(p)
 	}
-	v.users.mapLock.Lock()
-	defer v.users.mapLock.Unlock()
-	for i := range p.Users {
-		v.users.uidMap[format.UserTag(p.Tag, p.Users[i].Uuid)] = p.Users[i].Id
+	if p.NodeInfo == nil {
+		return nil, fmt.Errorf("node info is required")
 	}
-	var users []*protocol.User
 	switch p.NodeInfo.Type {
-	case "vmess":
-		users = buildVmessUsers(p.Tag, p.Users)
-	case "vless":
-		users = buildVlessUsers(p.Tag, p.Users, p.Protocol.Flow)
-	case "trojan":
-		users = buildTrojanUsers(p.Tag, p.Users)
-	case "shadowsocks":
-		users = buildSSUsers(p.Tag,
-			p.Users,
-			p.Protocol.Cipher,
-			p.Protocol.ServerKey)
-	case "hysteria2", "hysteria":
-		users = buildHysteria2Users(p.Tag, p.Users)
-	case "tuic":
-		users = buildTuicUsers(p.Tag, p.Users)
-	case "anytls":
-		users = buildAnyTLSUsers(p.Tag, p.Users)
+	case "vmess", "vless", "trojan", "shadowsocks", "hysteria2", "hysteria", "tuic", "anytls":
 	default:
-		return 0, fmt.Errorf("unsupported node type: %s", p.NodeInfo.Type)
+		return nil, fmt.Errorf("unsupported node type: %s", p.NodeInfo.Type)
 	}
 	man, err := v.GetUserManager(p.Tag)
 	if err != nil {
-		return 0, fmt.Errorf("get user manager error: %s", err)
+		return nil, fmt.Errorf("get user manager error: %s", err)
 	}
-	for _, u := range users {
-		mUser, err := u.ToMemoryUser()
-		if err != nil {
-			return 0, err
+	v.users.mapLock.Lock()
+	defer v.users.mapLock.Unlock()
+	added = make([]panel.UserInfo, 0, len(p.Users))
+	seen := make(map[string]struct{}, len(p.Users))
+	for i := range p.Users {
+		u := p.Users[i]
+		email := format.UserTag(p.Tag, u.Uuid)
+		if reason := v.invalidUserReason(p, u, email, seen); reason != "" {
+			log.WithFields(log.Fields{"tag": p.Tag, "uid": u.Id, "reason": reason}).Warn("用户无效，跳过")
+			continue
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		err = man.AddUser(ctx, mUser)
-		cancel()
-		if err != nil {
-			return 0, err
+		seen[u.Uuid] = struct{}{}
+		mUser, err := buildUser(p, &u).ToMemoryUser()
+		if err == nil {
+			// 先记 uid 再加入内核：加入后立刻产生的流量也能对上 uid
+			v.users.uidMap[email] = u.Id
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			err = man.AddUser(ctx, mUser)
+			cancel()
+			if err != nil {
+				delete(v.users.uidMap, email)
+			}
 		}
+		if err != nil {
+			log.WithFields(log.Fields{"tag": p.Tag, "uid": u.Id, "err": err}).Warn("用户加入内核失败，跳过")
+			continue
+		}
+		added = append(added, u)
 	}
-	return len(users), nil
+	return added, nil
 }
 
-func buildVmessUsers(tag string, userInfo []panel.UserInfo) (users []*protocol.User) {
-	users = make([]*protocol.User, len(userInfo))
-	for i, user := range userInfo {
-		users[i] = buildVmessUser(tag, &user)
+// invalidUserReason 加入内核前的校验，返回空字符串表示有效（调用方持有 users.mapLock）
+func (v *XrayCore) invalidUserReason(p *AddUsersParams, u panel.UserInfo, email string, seen map[string]struct{}) string {
+	switch {
+	case u.Id <= 0:
+		return "id 无效"
+	case u.Uuid == "":
+		return "uuid 为空"
 	}
-	return users
+	if _, dup := seen[u.Uuid]; dup {
+		return "同一批中 uuid 重复"
+	}
+	if _, exists := v.users.uidMap[email]; exists {
+		return "uuid 已在本入站中"
+	}
+	if p.NodeInfo.Type == "shadowsocks" && p.Protocol != nil {
+		if n := ss2022KeyLength(p.Protocol.Cipher); n > 0 && len(u.Uuid) < n {
+			return fmt.Sprintf("uuid 长度不足 %d，无法派生 SS2022 密钥", n)
+		}
+	}
+	return ""
+}
+
+// buildUser 按协议生成一个内核用户（类型已由调用方校验）
+func buildUser(p *AddUsersParams, u *panel.UserInfo) *protocol.User {
+	switch p.NodeInfo.Type {
+	case "vmess":
+		return buildVmessUser(p.Tag, u)
+	case "vless":
+		flow := ""
+		if p.Protocol != nil {
+			flow = p.Protocol.Flow
+		}
+		return buildVlessUser(p.Tag, u, flow)
+	case "trojan":
+		return buildTrojanUser(p.Tag, u)
+	case "shadowsocks":
+		cipher, serverKey := "", ""
+		if p.Protocol != nil {
+			cipher, serverKey = p.Protocol.Cipher, p.Protocol.ServerKey
+		}
+		return buildSSUser(p.Tag, u, cipher, serverKey)
+	case "hysteria2", "hysteria":
+		return buildHysteria2User(p.Tag, u)
+	case "tuic":
+		return buildTuicUser(p.Tag, u)
+	default: // anytls
+		return buildAnyTLSUser(p.Tag, u)
+	}
+}
+
+// ss2022KeyLength SS2022 用户密钥长度（字节），非 2022 加密返回 0
+func ss2022KeyLength(cipher string) int {
+	switch cipher {
+	case "2022-blake3-aes-128-gcm":
+		return 16
+	case "2022-blake3-aes-256-gcm", "2022-blake3-chacha20-poly1305":
+		return 32
+	}
+	return 0
 }
 
 func buildVmessUser(tag string, userInfo *panel.UserInfo) (user *protocol.User) {
@@ -180,14 +294,6 @@ func buildVmessUser(tag string, userInfo *panel.UserInfo) (user *protocol.User) 
 	}
 }
 
-func buildVlessUsers(tag string, userInfo []panel.UserInfo, flow string) (users []*protocol.User) {
-	users = make([]*protocol.User, len(userInfo))
-	for i := range userInfo {
-		users[i] = buildVlessUser(tag, &(userInfo)[i], flow)
-	}
-	return users
-}
-
 func buildVlessUser(tag string, userInfo *panel.UserInfo, flow string) (user *protocol.User) {
 	vlessAccount := &vless.Account{
 		Id: userInfo.Uuid,
@@ -200,14 +306,6 @@ func buildVlessUser(tag string, userInfo *panel.UserInfo, flow string) (user *pr
 	}
 }
 
-func buildTrojanUsers(tag string, userInfo []panel.UserInfo) (users []*protocol.User) {
-	users = make([]*protocol.User, len(userInfo))
-	for i := range userInfo {
-		users[i] = buildTrojanUser(tag, &(userInfo)[i])
-	}
-	return users
-}
-
 func buildTrojanUser(tag string, userInfo *panel.UserInfo) (user *protocol.User) {
 	trojanAccount := &trojan.Account{
 		Password: userInfo.Uuid,
@@ -217,14 +315,6 @@ func buildTrojanUser(tag string, userInfo *panel.UserInfo) (user *protocol.User)
 		Email:   format.UserTag(tag, userInfo.Uuid),
 		Account: serial.ToTypedMessage(trojanAccount),
 	}
-}
-
-func buildSSUsers(tag string, userInfo []panel.UserInfo, cypher string, serverKey string) (users []*protocol.User) {
-	users = make([]*protocol.User, len(userInfo))
-	for i := range userInfo {
-		users[i] = buildSSUser(tag, &userInfo[i], cypher, serverKey)
-	}
-	return users
 }
 
 func buildSSUser(tag string, userInfo *panel.UserInfo, cypher string, serverKey string) (user *protocol.User) {
@@ -239,14 +329,10 @@ func buildSSUser(tag string, userInfo *panel.UserInfo, cypher string, serverKey 
 			Account: serial.ToTypedMessage(ssAccount),
 		}
 	} else {
-		var keyLength int
-		switch cypher {
-		case "2022-blake3-aes-128-gcm":
-			keyLength = 16
-		case "2022-blake3-aes-256-gcm":
-			keyLength = 32
-		case "2022-blake3-chacha20-poly1305":
-			keyLength = 32
+		keyLength := ss2022KeyLength(cypher)
+		if len(userInfo.Uuid) < keyLength {
+			// 防御：AddUsers 已校验长度，这里不能因切片越界 panic
+			keyLength = len(userInfo.Uuid)
 		}
 		ssAccount := &shadowsocks_2022.Account{
 			Key: base64.StdEncoding.EncodeToString([]byte(userInfo.Uuid[:keyLength])),
@@ -272,14 +358,6 @@ func getCipherFromString(c string) shadowsocks.CipherType {
 	}
 }
 
-func buildHysteria2Users(tag string, userInfo []panel.UserInfo) (users []*protocol.User) {
-	users = make([]*protocol.User, len(userInfo))
-	for i := range userInfo {
-		users[i] = buildHysteria2User(tag, &userInfo[i])
-	}
-	return users
-}
-
 func buildHysteria2User(tag string, userInfo *panel.UserInfo) (user *protocol.User) {
 	hysteria2Account := &hyaccount.Account{
 		Auth: userInfo.Uuid,
@@ -289,14 +367,6 @@ func buildHysteria2User(tag string, userInfo *panel.UserInfo) (user *protocol.Us
 		Email:   format.UserTag(tag, userInfo.Uuid),
 		Account: serial.ToTypedMessage(hysteria2Account),
 	}
-}
-
-func buildTuicUsers(tag string, userInfo []panel.UserInfo) (users []*protocol.User) {
-	users = make([]*protocol.User, len(userInfo))
-	for i := range userInfo {
-		users[i] = buildTuicUser(tag, &userInfo[i])
-	}
-	return users
 }
 
 func buildTuicUser(tag string, userInfo *panel.UserInfo) (user *protocol.User) {
@@ -309,14 +379,6 @@ func buildTuicUser(tag string, userInfo *panel.UserInfo) (user *protocol.User) {
 		Email:   format.UserTag(tag, userInfo.Uuid),
 		Account: serial.ToTypedMessage(tuicAccount),
 	}
-}
-
-func buildAnyTLSUsers(tag string, userInfo []panel.UserInfo) (users []*protocol.User) {
-	users = make([]*protocol.User, len(userInfo))
-	for i := range userInfo {
-		users[i] = buildAnyTLSUser(tag, &userInfo[i])
-	}
-	return users
 }
 
 func buildAnyTLSUser(tag string, userInfo *panel.UserInfo) (user *protocol.User) {

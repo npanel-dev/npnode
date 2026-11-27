@@ -9,9 +9,8 @@ import (
 	"sync"
 
 	"github.com/npanel-dev/npnode/api/panel"
-	"github.com/npanel-dev/npnode/common/counter"
 	"github.com/npanel-dev/npnode/common/format"
-	"github.com/npanel-dev/npnode/core/app/dispatcher"
+	log "github.com/sirupsen/logrus"
 	coreConf "github.com/xtls/xray-core/infra/conf"
 )
 
@@ -102,45 +101,58 @@ func (v *XrayCore) rebuildPlainProxy(tag string) error {
 	return v.addInbound(config)
 }
 
-func (v *XrayCore) addPlainProxyUsers(p *AddUsersParams) (int, error) {
+// addPlainProxyUsers 校验后把用户并入账号集合并重建入站；单条无效只跳过。重建失败时撤回本次新增的用户。
+func (v *XrayCore) addPlainProxyUsers(p *AddUsersParams) ([]panel.UserInfo, error) {
 	plainProxies.mu.Lock()
 	defer plainProxies.mu.Unlock()
 	ib := plainProxies.inbounds[p.Tag]
 	if ib == nil {
-		return 0, fmt.Errorf("no plain proxy inbound %s", p.Tag)
+		return nil, fmt.Errorf("no plain proxy inbound %s", p.Tag)
 	}
 	v.users.mapLock.Lock()
+	added := make([]panel.UserInfo, 0, len(p.Users))
+	seen := make(map[string]struct{}, len(p.Users))
 	for i := range p.Users {
-		v.users.uidMap[format.UserTag(p.Tag, p.Users[i].Uuid)] = p.Users[i].Id
-		ib.users[p.Users[i].Uuid] = true
+		u := p.Users[i]
+		email := format.UserTag(p.Tag, u.Uuid)
+		if reason := v.invalidUserReason(p, u, email, seen); reason != "" {
+			log.WithFields(log.Fields{"tag": p.Tag, "uid": u.Id, "reason": reason}).Warn("用户无效，跳过")
+			continue
+		}
+		seen[u.Uuid] = struct{}{}
+		v.users.uidMap[email] = u.Id
+		ib.users[u.Uuid] = true
+		added = append(added, u)
 	}
 	v.users.mapLock.Unlock()
 	if err := v.rebuildPlainProxy(p.Tag); err != nil {
-		return 0, err
+		v.users.mapLock.Lock()
+		for _, u := range added {
+			delete(v.users.uidMap, format.UserTag(p.Tag, u.Uuid))
+			delete(ib.users, u.Uuid)
+		}
+		v.users.mapLock.Unlock()
+		return nil, err
 	}
-	return len(p.Users), nil
+	return added, nil
 }
 
-func (v *XrayCore) delPlainProxyUsers(users []panel.UserInfo, tag string) error {
+// delPlainProxyUsers 移出账号集合并重建入站；未上报的流量保留到下一次上报（U2）
+func (v *XrayCore) delPlainProxyUsers(users []panel.UserInfo, tag string) ([]panel.UserInfo, error) {
 	plainProxies.mu.Lock()
 	defer plainProxies.mu.Unlock()
 	ib := plainProxies.inbounds[tag]
 	if ib == nil {
-		return fmt.Errorf("no plain proxy inbound %s", tag)
+		return nil, fmt.Errorf("no plain proxy inbound %s", tag)
 	}
 	v.users.mapLock.Lock()
 	for i := range users {
 		user := format.UserTag(tag, users[i].Uuid)
 		delete(ib.users, users[i].Uuid)
-		delete(v.users.uidMap, user)
-		if c, ok := v.dispatcher.Counter.Load(tag); ok {
-			c.(*counter.TrafficCounter).Delete(user)
-		}
-		if lm, ok := v.dispatcher.LinkManagers.Load(user); ok {
-			lm.(*dispatcher.LinkManager).CloseAll()
-			v.dispatcher.LinkManagers.Delete(user)
-		}
+		v.closeUserLinksLocked(user)
+		v.retireUserCounterLocked(tag, user)
 	}
 	v.users.mapLock.Unlock()
-	return v.rebuildPlainProxy(tag)
+	// 重建失败时入站已不可用（旧入站已移除），这些用户也不在内核里了，仍按已移除处理
+	return users, v.rebuildPlainProxy(tag)
 }
