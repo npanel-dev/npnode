@@ -27,6 +27,10 @@ func (v *XrayCore) DelNode(tag string) error {
 	plainProxies.mu.Lock()
 	delete(plainProxies.inbounds, tag)
 	plainProxies.mu.Unlock()
+	// 入站已移除：不再有人读这些已移除用户的计数器，不留指针
+	v.users.mapLock.Lock()
+	delete(v.users.retired, tag)
+	v.users.mapLock.Unlock()
 	err := v.removeInbound(tag)
 	if err != nil {
 		return fmt.Errorf("remove in error: %s", err)

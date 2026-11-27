@@ -21,6 +21,7 @@ import (
 	"github.com/xtls/xray-core/features/outbound"
 	"github.com/xtls/xray-core/features/routing"
 	coreConf "github.com/xtls/xray-core/infra/conf"
+	"github.com/xtls/xray-core/proxy"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -43,6 +44,8 @@ type XrayCore struct {
 	ihm           inbound.Manager
 	ohm           outbound.Manager
 	dispatcher    *dispatcher.DefaultDispatcher
+	// userManagerFor 仅供测试注入 UserManager（模拟内核报错），生产为 nil
+	userManagerFor func(tag string) (proxy.UserManager, error)
 }
 
 type UserMap struct {

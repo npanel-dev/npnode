@@ -27,6 +27,9 @@ import (
 )
 
 func (v *XrayCore) GetUserManager(tag string) (proxy.UserManager, error) {
+	if v.userManagerFor != nil {
+		return v.userManagerFor(tag)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	handler, err := v.ihm.GetHandler(ctx, tag)
@@ -146,7 +149,9 @@ func (vc *XrayCore) GetUserTrafficSlice(tag string, mintraffic int) ([]panel.Use
 	return trafficSlice, nil
 }
 
-// mergeRetiredTraffic 把已移除用户的残留流量并入本次上报；同一 id（如先删后加、重置名额换 uuid）合并为一条
+// mergeRetiredTraffic 把已移除用户的残留流量并入本次上报；同一 id（如先删后加、重置名额换 uuid）合并为一条。
+// 每个已移除用户的计数器只读这一次，之后即丢弃：在这次读出之后才写入的在途字节不再上报。
+// 连接在移除时已被 CloseAll 断开，到下一次上报（至少一个上报周期后）仍在写入的字节极少，这部分误差可以接受。
 func mergeRetiredTraffic(traffic []panel.UserTraffic, retired []retiredCounter) []panel.UserTraffic {
 	index := make(map[int]int, len(traffic))
 	for i, t := range traffic {

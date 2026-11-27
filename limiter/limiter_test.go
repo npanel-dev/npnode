@@ -63,3 +63,18 @@ func TestSpeedLimitKeepsLegacyMbpsWithoutSeatV1(t *testing.T) {
 		t.Error("speed_limit=0 must mean unlimited")
 	}
 }
+
+// 限速口径在建立限速器时确定：之后开关改变（重载前）不影响已建立的限速器
+func TestSpeedLimitUnitIsFixedAtAddLimiter(t *testing.T) {
+	panel.SetSeatV1(true)
+	t.Cleanup(func() { panel.SetSeatV1(false) })
+	Init()
+	const tag = "limiter-fixed"
+	l := AddLimiter(tag, []panel.UserInfo{{Id: 1, Uuid: "u-1", SpeedLimit: 10485760}}, nil)
+	t.Cleanup(func() { DeleteLimiter(tag) })
+	panel.SetSeatV1(false)
+	bucket, _ := l.CheckLimit(format.UserTag(tag, "u-1"), "203.0.113.7", true, true)
+	if bucket == nil || bucket.Capacity() != 1310720 {
+		t.Fatalf("bucket = %v, want 1310720 B/s fixed at AddLimiter", bucket)
+	}
+}
