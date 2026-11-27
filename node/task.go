@@ -29,6 +29,19 @@ func (c *Controller) startTasks(node *panel.NodeInfo) {
 	log.WithField("节点", c.tag).Info("用户列表监控任务已启动")
 	_ = c.userReportPeriodic.Start(false)
 	log.WithField("节点", c.tag).Info("用户流量报告任务已启动")
+	// online_v1：在线上报拆成独立任务，周期 min(PushInterval, 60s)（O2）；流量上报周期不变。
+	// 未声明时在线仍随流量任务上报，内容与时机与旧版一致。
+	c.onlineIpReportPeriodic = nil
+	if !c.trafficTaskReportsOnline() {
+		c.onlineIpReportPeriodic = &task.Task{
+			Name:     "reportOnlineUsers",
+			Interval: onlineReportInterval(node.PushInterval),
+			Execute:  c.reportOnlineUsersTask,
+			ReloadCh: c.server.ReloadCh,
+		}
+		_ = c.onlineIpReportPeriodic.Start(false)
+		log.WithField("节点", c.tag).Infof("在线用户报告任务已启动（每 %s）", c.onlineIpReportPeriodic.Interval)
+	}
 	var security string
 	switch node.Type {
 	case "vless":
@@ -74,6 +87,9 @@ func (c *Controller) startTasks(node *panel.NodeInfo) {
 func (c *Controller) reloadTask() {
 	c.userListMonitorPeriodic.Close()
 	c.userReportPeriodic.Close()
+	if c.onlineIpReportPeriodic != nil {
+		c.onlineIpReportPeriodic.Close()
+	}
 	if c.renewCertPeriodic != nil {
 		c.renewCertPeriodic.Close()
 	}
@@ -164,21 +180,11 @@ func (c *Controller) reportUserTrafficTask(ctx context.Context) (err error) {
 	// 流量：按顺序上报待上报队列，失败的保留到下一轮
 	c.flushPendingTraffic(ctx, useSync)
 
-	// 在线用户
-	if onlineDevice, err := c.limiter.GetOnlineDevice(); err != nil {
-		log.Print(err)
-	} else {
-		result := onlineUsersForReport(*onlineDevice, userTraffic)
-		if useSync {
-			err = c.grpcClient.SendOnlineUsers(protocol, port, result)
-		} else {
-			err = c.apiClient.ReportNodeOnlineUsers(ctx, &result)
-		}
-		if err != nil {
-			log.WithFields(log.Fields{"tag": c.tag, "err": err}).Info("Report online users failed")
-		} else {
-			log.WithField("节点", c.tag).Infof("总计 %d 名在线用户, %d 名已上报", len(*onlineDevice), len(result))
-		}
+	// 在线用户（未声明 online_v1 时随流量任务上报，否则由独立任务上报）
+	if c.trafficTaskReportsOnline() {
+		c.reportOnlineUsers(ctx, useSync, func(online []panel.OnlineUser) []panel.OnlineUser {
+			return onlineUsersForReport(online, userTraffic)
+		})
 	}
 
 	// 状态
@@ -195,6 +201,47 @@ func (c *Controller) reportUserTrafficTask(ctx context.Context) (err error) {
 		log.WithFields(log.Fields{"tag": c.tag, "err": err}).Info("Report status failed")
 	}
 	return nil
+}
+
+// trafficTaskReportsOnline 在线是否随流量任务上报：未声明 online_v1（限速器没有活跃连接表）时是
+func (c *Controller) trafficTaskReportsOnline() bool {
+	return c.limiter == nil || !c.limiter.ActiveOnline()
+}
+
+// onlineReportInterval 在线上报周期：min(PushInterval, 60s)，PushInterval 无效时按 60 秒（O2）
+func onlineReportInterval(pushInterval int) time.Duration {
+	if pushInterval <= 0 || pushInterval > 60 {
+		return 60 * time.Second
+	}
+	return time.Duration(pushInterval) * time.Second
+}
+
+// reportOnlineUsersTask online_v1 的独立在线上报任务：上报此刻活跃连接的 (uid, ip)，
+// 不按本周期流量过滤（空闲连接也算在线，O1）；没有在线时上报空列表（O5）
+func (c *Controller) reportOnlineUsersTask(ctx context.Context) error {
+	useSync := c.grpcClient != nil && c.grpcClient.IsSyncConnected()
+	c.reportOnlineUsers(ctx, useSync, func(online []panel.OnlineUser) []panel.OnlineUser { return online })
+	return nil
+}
+
+// reportOnlineUsers 读出本周期在线并上报；filter 决定实际上报哪些
+func (c *Controller) reportOnlineUsers(ctx context.Context, useSync bool, filter func([]panel.OnlineUser) []panel.OnlineUser) {
+	onlineDevice, err := c.limiter.GetOnlineDevice()
+	if err != nil {
+		log.Print(err)
+		return
+	}
+	result := filter(*onlineDevice)
+	if useSync {
+		err = c.grpcClient.SendOnlineUsers(c.info.Type, c.info.Protocol.Port, result)
+	} else {
+		err = c.apiClient.ReportNodeOnlineUsers(ctx, &result)
+	}
+	if err != nil {
+		log.WithFields(log.Fields{"tag": c.tag, "err": err}).Info("Report online users failed")
+	} else {
+		log.WithField("节点", c.tag).Infof("总计 %d 名在线用户, %d 名已上报", len(*onlineDevice), len(result))
+	}
 }
 
 // queueTrafficReport keeps collected bytes in the node-wide queue across reloads.
