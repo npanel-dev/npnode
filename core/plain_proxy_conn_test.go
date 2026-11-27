@@ -146,3 +146,39 @@ func TestPlainProxySkipsRebuildWithoutChange(t *testing.T) {
 		t.Fatalf("accounts = %v, want [%s]", got, uuidA)
 	}
 }
+
+// 重建失败后（旧入站已移除、新入站没监听起来）下一次增删即使账号集合不变也要重试重建（审查 M6）
+func TestPlainProxyRetriesFailedRebuild(t *testing.T) {
+	info := &panel.NodeInfo{Id: 1, Type: "socks", Protocol: &panel.Protocol{Type: "socks", Port: freePort(t)}}
+	vc, tag := seatTestCore(t, info)
+	t.Cleanup(func() { _ = vc.DelNode(tag) })
+	if _, err := vc.AddUsers(&AddUsersParams{Tag: tag, NodeInfo: info, Users: []panel.UserInfo{{Id: 7, Uuid: uuidA}}}); err != nil {
+		t.Fatal(err)
+	}
+	// 让下一次重建监听失败：端口被占用
+	blocker, err := net.Listen("tcp", ":0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	origPort := info.Protocol.Port
+	info.Protocol.Port = blocker.Addr().(*net.TCPAddr).Port
+	if _, err := vc.AddUsers(&AddUsersParams{Tag: tag, NodeInfo: info, Users: []panel.UserInfo{{Id: 8, Uuid: uuidB}}}); err == nil {
+		t.Fatal("rebuild on an occupied port must fail")
+	}
+	// 内核里仍挂着这个入站，但没有监听：原端口已经连不上
+	if c, err := net.DialTimeout("tcp", "127.0.0.1:"+strconv.Itoa(origPort), time.Second); err == nil {
+		c.Close()
+		t.Fatal("old listener still accepting after the rebuild removed it")
+	}
+	blocker.Close()
+	info.Protocol.Port = origPort
+	// 集合不变（全部无效）的一轮同步：仍要重试重建
+	if _, err := vc.AddUsers(&AddUsersParams{Tag: tag, NodeInfo: info, Users: []panel.UserInfo{{Id: 0, Uuid: uuidC}}}); err != nil {
+		t.Fatal(err)
+	}
+	c, err := net.DialTimeout("tcp", "127.0.0.1:"+strconv.Itoa(origPort), time.Second)
+	if err != nil {
+		t.Fatalf("inbound still not listening after the next sync: %v", err)
+	}
+	c.Close()
+}

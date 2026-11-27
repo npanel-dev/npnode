@@ -26,6 +26,8 @@ func isPlainProxy(protocolType string) bool {
 type plainProxyInbound struct {
 	info  *panel.NodeInfo
 	users map[string]bool // uuid
+	// broken 上一次重建失败（旧入站已移除，新入站没建起来或没监听）：下一次增删无论集合是否变化都重建
+	broken bool
 }
 
 type plainProxyRegistry struct {
@@ -99,7 +101,9 @@ func (v *XrayCore) rebuildPlainProxy(tag string) error {
 		return err
 	}
 	_ = v.removeInbound(tag)
-	return v.addInbound(config)
+	err = v.addInbound(config)
+	ib.broken = err != nil
+	return err
 }
 
 // addPlainProxyUsers 校验后把用户并入账号集合并重建入站；单条无效只跳过。重建失败时撤回本次新增的用户。
@@ -126,7 +130,7 @@ func (v *XrayCore) addPlainProxyUsers(p *AddUsersParams) ([]panel.UserInfo, erro
 		added = append(added, u)
 	}
 	v.users.mapLock.Unlock()
-	if len(added) == 0 {
+	if len(added) == 0 && !ib.broken {
 		// 账号集合没变：不重建（无效条目每轮同步都会被静默重试，不能每次都整表重建）
 		return added, nil
 	}
@@ -162,7 +166,7 @@ func (v *XrayCore) delPlainProxyUsers(users []panel.UserInfo, tag string) ([]pan
 		v.retireUserCounterLocked(tag, user)
 	}
 	v.users.mapLock.Unlock()
-	if !changed {
+	if !changed && !ib.broken {
 		// 要删的账号本来就不在集合里（与 UserManager 的 not found 一样按已移除处理）：集合没变，不重建
 		return users, nil
 	}
