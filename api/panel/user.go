@@ -8,9 +8,10 @@ import (
 	"path"
 )
 
+// OnlineUser 在线用户。面板按小写键 uid / ip 解析（旧版面板读不到大写键，整批拒收）
 type OnlineUser struct {
-	UID int
-	IP  string
+	UID int    `json:"uid"`
+	IP  string `json:"ip"`
 }
 
 type UserInfo struct {
@@ -199,6 +200,9 @@ func (c *ClientV1) ReportNodeOnlineUsers(ctx context.Context, data *[]OnlineUser
 		body := r.Body()
 		return fmt.Errorf("访问 %s 失败: %s", path.Join(c.APIHost+p), string(body))
 	}
-
+	// 与流量上报相同：业务失败时 HTTP 仍是 200，错误码在响应体 code 里
+	if err := checkPanelBodyCode(r.Body()); err != nil {
+		return fmt.Errorf("访问 %s 失败: %w", path.Join(c.APIHost+p), err)
+	}
 	return nil
 }
