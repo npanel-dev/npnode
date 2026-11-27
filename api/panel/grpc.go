@@ -250,6 +250,12 @@ type SyncHandler interface {
 	OnSyncDisconnected()
 }
 
+// UserUpdateLossHandler 可选：某个入站的分片推送没有收齐（缺片、被打断、超时）时通知，
+// 实现方应作废该入站的本地推送版本并重新订阅取全量。
+type UserUpdateLossHandler interface {
+	OnUserUpdateLost(protocol string, port int)
+}
+
 // Inbound 一个入站（协议 + 端口）
 type Inbound struct {
 	Protocol string
@@ -505,6 +511,17 @@ func (g *GrpcClient) runSyncLoop(handler SyncHandler, done <-chan struct{}) {
 
 		log.Info("[grpc.Sync] stream opened")
 
+		// 每条流单独重组分片：流断开后未收齐的分片作废，重连后面板会重新推送全量
+		assembler := newChunkAssembler(func(u UserUpdate) {
+			if handler != nil {
+				handler.OnUserUpdate(u)
+			}
+		}, func(protocol string, port int) {
+			if lh, ok := handler.(UserUpdateLossHandler); ok {
+				lh.OnUserUpdateLost(protocol, port)
+			}
+		}, chunkAssembleTimeout)
+
 		// Heartbeat: send keepalive Status every 30s to prevent Cloudflare 524 timeout
 		streamDone := make(chan struct{})
 		go g.syncHeartbeat(stream, streamDone)
@@ -538,15 +555,8 @@ func (g *GrpcClient) runSyncLoop(handler SyncHandler, done <-chan struct{}) {
 			switch payload := resp.Payload.(type) {
 			case *nodev1.SyncResponse_UserUpdate:
 				if handler != nil {
-					u := payload.UserUpdate
-					handler.OnUserUpdate(UserUpdate{
-						Protocol: u.GetProtocol(),
-						Port:     int(u.GetPort()),
-						Version:  u.GetVersion(),
-						Action:   u.GetAction(),
-						Users:    userEntriesToInfo(u.GetUsers()),
-						Removed:  userEntriesToInfo(u.GetRemoved()),
-					})
+					// 分片收齐后才交给 handler；没有分片的推送原样分发
+					assembler.handle(payload.UserUpdate)
 				}
 			case *nodev1.SyncResponse_ConfigUpdate:
 				if handler != nil {
@@ -567,6 +577,7 @@ func (g *GrpcClient) runSyncLoop(handler SyncHandler, done <-chan struct{}) {
 
 		close(streamDone)
 		markReady.Stop()
+		assembler.reset()
 
 		g.mu.Lock()
 		streamActive = false

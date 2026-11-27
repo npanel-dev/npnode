@@ -164,6 +164,19 @@ func (n *Node) OnUserUpdate(u panel.UserUpdate) {
 	}
 }
 
+// OnUserUpdateLost 某个入站的分片推送没有收齐：已有部分不能应用，作废本地版本并重新订阅取全量
+func (n *Node) OnUserUpdateLost(protocol string, port int) {
+	for _, c := range n.controllers {
+		if c == nil || c.grpcClient == nil || !c.info.Protocol.Enable {
+			continue
+		}
+		if c.info.Type == protocol && c.info.Protocol.Port == port {
+			c.resetSync()
+			c.resubscribe()
+		}
+	}
+}
+
 // OnConfigUpdate 面板通知配置变了：立即走一次带 ETag 的配置检查（有变化才重载），
 // 不必等定时检查。在单独的协程里做，避免阻塞 Sync 接收循环；连续通知合并成一次。
 func (n *Node) OnConfigUpdate(reason string) {
