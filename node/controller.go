@@ -27,6 +27,9 @@ type Controller struct {
 	tag                     string
 	limiter                 *limiter.Limiter
 	userList                []panel.UserInfo
+	// rejected 本入站加入失败过的条目（键 rejectKey：id + uuid + 参数），同一内容再失败不重复告警（U3 ④）。
+	// 内容变化（键变了）或面板移除该条目时清掉；受 userMu 保护
+	rejected map[string]struct{}
 	aliveMap                map[int]int
 	info                    *panel.NodeInfo
 	traffic                 *trafficQueue
@@ -111,10 +114,12 @@ func (c *Controller) Start() error {
 		Tag:      c.tag,
 		Users:    c.userList,
 		NodeInfo: c.info,
+		Quiet:    c.isRejectedLocked,
 	})
 	if err != nil {
 		return fmt.Errorf("add users error: %s", err)
 	}
+	c.recordRejectedLocked(c.userList, added)
 	// 单条失败只跳过（内核已记日志）：本地只记实际加入的用户，下一轮同步重试其余的
 	if len(added) != len(c.userList) {
 		c.syncLimiterAfterPartialAdd(added)

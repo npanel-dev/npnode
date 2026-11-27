@@ -28,7 +28,63 @@ func (c *Controller) pushHealthyLocked() bool {
 // 返回实际新增、删除的数量；单条失败的用户不计入，下一轮会重试。
 func (c *Controller) applyUserSetLocked(users []panel.UserInfo) (added, deleted int, err error) {
 	del, add := compareUserList(c.userList, users)
-	return c.applyChangesLocked(del, add)
+	added, deleted, err = c.applyChangesLocked(del, add)
+	c.pruneRejectedLocked(users)
+	return added, deleted, err
+}
+
+// rejectKey 无效条目记忆的键：id 与内核身份键（uuid、限速、设备数）都相同才算同一内容
+func rejectKey(u panel.UserInfo) string {
+	return strconv.Itoa(u.Id) + "|" + userSyncKey(u)
+}
+
+// isRejectedLocked 这条内容之前是否已加入失败并告警过（调用方持有 userMu，或在 Start 中单线程调用）
+func (c *Controller) isRejectedLocked(u panel.UserInfo) bool {
+	_, ok := c.rejected[rejectKey(u)]
+	return ok
+}
+
+// recordRejectedLocked 按一次加入的结果更新记忆：失败的记下，成功的清掉。失败的条目之后仍会被静默重试
+// （例如同批 uuid 重复的那条，在另一条被移除后就能加入）
+func (c *Controller) recordRejectedLocked(tried, added []panel.UserInfo) {
+	ok := make(map[string]int, len(added))
+	for _, u := range added {
+		ok[rejectKey(u)]++
+	}
+	for _, u := range tried {
+		k := rejectKey(u)
+		if ok[k] > 0 {
+			ok[k]--
+			delete(c.rejected, k)
+			continue
+		}
+		if c.rejected == nil {
+			c.rejected = make(map[string]struct{})
+		}
+		c.rejected[k] = struct{}{}
+	}
+}
+
+// pruneRejectedLocked 全量对齐后只保留仍在面板列表里的记忆：内容变化或被移除的条目清掉
+func (c *Controller) pruneRejectedLocked(users []panel.UserInfo) {
+	if len(c.rejected) == 0 {
+		return
+	}
+	keep := make(map[string]struct{}, len(c.rejected))
+	for _, u := range users {
+		k := rejectKey(u)
+		if _, ok := c.rejected[k]; ok {
+			keep[k] = struct{}{}
+		}
+	}
+	c.rejected = keep
+}
+
+// forgetRejectedLocked 面板差量移除了这些条目：清掉它们的记忆
+func (c *Controller) forgetRejectedLocked(removed []panel.UserInfo) {
+	for _, u := range removed {
+		delete(c.rejected, rejectKey(u))
+	}
 }
 
 // applyChangesLocked 先删后加，并保证 c.userList 始终与内核实际状态一致：
@@ -49,10 +105,11 @@ func (c *Controller) applyChangesLocked(deleted, added []panel.UserInfo) (addedN
 		}
 	}
 	if len(added) > 0 {
-		ok, err := c.server.AddUsers(&vCore.AddUsersParams{Tag: c.tag, NodeInfo: c.info, Users: added})
+		ok, err := c.server.AddUsers(&vCore.AddUsersParams{Tag: c.tag, NodeInfo: c.info, Users: added, Quiet: c.isRejectedLocked})
 		if err != nil {
 			return 0, deletedN, err
 		}
+		c.recordRejectedLocked(added, ok)
 		c.userList = append(c.userList, ok...)
 		c.limiter.UpdateUser(c.tag, ok, nil)
 		addedN = len(ok)
@@ -113,6 +170,7 @@ func (c *Controller) ApplyUserUpdate(u panel.UserUpdate) {
 		for _, x := range c.userList {
 			present[userSyncKey(x)] = true
 		}
+		c.forgetRejectedLocked(u.Removed)
 		var deleted, added []panel.UserInfo
 		for _, x := range u.Removed {
 			if present[userSyncKey(x)] {

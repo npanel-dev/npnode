@@ -202,7 +202,7 @@ func (v *XrayCore) AddUsers(p *AddUsersParams) (added []panel.UserInfo, err erro
 		u := p.Users[i]
 		email := format.UserTag(p.Tag, u.Uuid)
 		if reason := v.invalidUserReason(p, u, email, seen); reason != "" {
-			log.WithFields(log.Fields{"tag": p.Tag, "uid": u.Id, "reason": reason}).Warn("用户无效，跳过")
+			p.logSkip(u, "reason", reason, "用户无效，跳过")
 			continue
 		}
 		seen[u.Uuid] = struct{}{}
@@ -218,7 +218,7 @@ func (v *XrayCore) AddUsers(p *AddUsersParams) (added []panel.UserInfo, err erro
 			}
 		}
 		if err != nil {
-			log.WithFields(log.Fields{"tag": p.Tag, "uid": u.Id, "err": err}).Warn("用户加入内核失败，跳过")
+			p.logSkip(u, "err", err, "用户加入内核失败，跳过")
 			continue
 		}
 		added = append(added, u)
