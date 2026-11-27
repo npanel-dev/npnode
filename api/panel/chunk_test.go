@@ -213,3 +213,66 @@ func TestChunkAssemblerResetClearsBuffers(t *testing.T) {
 		t.Fatalf("delivered = %+v", got)
 	}
 }
+
+// 超时作废后，面板从第 1 片起重发同一 version / total 的序列：必须视为新序列、正常重组分发
+func TestChunkAssemblerRestartsOnChunkOneAfterDiscard(t *testing.T) {
+	a, p := newProbeAssembler(50 * time.Millisecond)
+	a.handle(chunk("vless", 443, full, 1, 1, 2, []*nodev1.UserEntry{ue(1)}, nil))
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, lost := p.snapshot(); len(lost) == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("incomplete sequence did not time out")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	a.handle(chunk("vless", 443, full, 1, 1, 2, []*nodev1.UserEntry{ue(1)}, nil))
+	a.handle(chunk("vless", 443, full, 1, 2, 2, []*nodev1.UserEntry{ue(2)}, nil))
+	got, lost := p.snapshot()
+	if len(got) != 1 || !sameInts(ids(got[0].Users), 1, 2) {
+		t.Fatalf("resent sequence must be delivered: delivered=%+v lost=%v", got, lost)
+	}
+	if len(lost) != 1 {
+		t.Fatalf("lost = %v, want only the timeout", lost)
+	}
+}
+
+// 缺片作废后，同一 version 从第 1 片重发同样要能重组
+func TestChunkAssemblerRestartsOnChunkOneAfterGap(t *testing.T) {
+	a, p := newProbeAssembler(time.Minute)
+	a.handle(chunk("vless", 443, diff, 4, 1, 3, nil, []*nodev1.UserEntry{ue(1)}))
+	a.handle(chunk("vless", 443, diff, 4, 3, 3, nil, nil)) // 缺第 2 片
+	a.handle(chunk("vless", 443, diff, 4, 1, 2, nil, []*nodev1.UserEntry{ue(1)}))
+	a.handle(chunk("vless", 443, diff, 4, 2, 2, []*nodev1.UserEntry{ue(2)}, nil))
+	got, lost := p.snapshot()
+	if len(got) != 1 || !sameInts(ids(got[0].Removed), 1) || !sameInts(ids(got[0].Users), 2) || len(lost) != 1 {
+		t.Fatalf("delivered=%+v lost=%v", got, lost)
+	}
+	// 未作废、未收齐时又来了第 1 片：旧序列算丢失（通知一次），新序列从头开始
+	a.handle(chunk("vless", 443, full, 7, 1, 2, []*nodev1.UserEntry{ue(5)}, nil))
+	a.handle(chunk("vless", 443, full, 7, 1, 2, []*nodev1.UserEntry{ue(6)}, nil))
+	a.handle(chunk("vless", 443, full, 7, 2, 2, []*nodev1.UserEntry{ue(7)}, nil))
+	got, lost = p.snapshot()
+	if len(got) != 2 || !sameInts(ids(got[1].Users), 6, 7) || len(lost) != 2 {
+		t.Fatalf("restart: delivered=%+v lost=%v", got, lost)
+	}
+}
+
+// 超时按空闲计算：每收到一片就重新计时，分片间隔小于超时、总时长远超超时也能收齐
+// （按比例缩小：超时 300ms、每 200ms 一片、共 1s，对应 30 秒空闲、每 20 秒一片、共 90 秒以上）
+func TestChunkAssemblerTimeoutIsIdleNotTotal(t *testing.T) {
+	a, p := newProbeAssembler(300 * time.Millisecond)
+	const total = 6
+	for no := uint32(1); no <= total; no++ {
+		if no > 1 {
+			time.Sleep(200 * time.Millisecond)
+		}
+		a.handle(chunk("vless", 443, full, 2, no, total, []*nodev1.UserEntry{ue(int64(no))}, nil))
+	}
+	got, lost := p.snapshot()
+	if len(lost) != 0 || len(got) != 1 || !sameInts(ids(got[0].Users), 1, 2, 3, 4, 5, 6) {
+		t.Fatalf("delivered=%+v lost=%v", got, lost)
+	}
+}
