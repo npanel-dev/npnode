@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"path"
+	"sync/atomic"
+	"time"
 )
 
 // OnlineUser 在线用户。面板按小写键 uid / ip 解析（旧版面板读不到大写键，整批拒收）
@@ -121,6 +123,60 @@ func (c *ClientV1) GetUserAlive() (map[int]int, error) {
 
 type ServerPushUserTrafficRequest struct {
 	Traffic []UserTraffic `json:"traffic"`
+	// 以下为可靠回执字段（T3），只在打开 Api.TrafficIdempotent 时填写；为零值时不出现在请求体中，与旧版一致。
+	// 面板 traffic_report_mode=off 时忽略；shadow / enforce 时按 boot_id + sequence 生成幂等键
+	BootID     string `json:"boot_id,omitempty"`
+	Sequence   uint64 `json:"sequence,omitempty"`
+	ReportedAt int64  `json:"reported_at,omitempty"`
+}
+
+// HTTPTrafficBatch 一批带批次号的 HTTP 流量上报。失败后必须原样重发（同一 boot_id、sequence 与内容），
+// 面板 enforce 模式下同一幂等键内容不同会被拒绝
+type HTTPTrafficBatch struct {
+	Traffic    []UserTraffic
+	BootID     string
+	Sequence   uint64
+	ReportedAt int64
+}
+
+var (
+	// httpBootID 本进程的启动标识（HTTP 流量上报用），进程内不变；gRPC 客户端各有自己的 bootID
+	httpBootID = newBootID()
+	httpSeq    atomic.Uint64
+	// trafficIdempotent 是否给 HTTP 流量上报带批次号（Api.TrafficIdempotent）
+	trafficIdempotent atomic.Bool
+)
+
+// SetTrafficIdempotent 设置 HTTP 流量上报是否带批次号（启动、重载时由 cmd 按配置设置）
+func SetTrafficIdempotent(on bool) {
+	trafficIdempotent.Store(on)
+}
+
+// TrafficIdempotentEnabled HTTP 流量上报是否带批次号
+func TrafficIdempotentEnabled() bool {
+	return trafficIdempotent.Load()
+}
+
+// NewHTTPTrafficBatch 冻结一批流量并分配批次号：本进程 boot_id + 自增 sequence，reported_at 为采集时间
+func NewHTTPTrafficBatch(traffic []UserTraffic) *HTTPTrafficBatch {
+	frozen := make([]UserTraffic, len(traffic))
+	copy(frozen, traffic)
+	return &HTTPTrafficBatch{
+		Traffic:    frozen,
+		BootID:     httpBootID,
+		Sequence:   httpSeq.Add(1),
+		ReportedAt: time.Now().Unix(),
+	}
+}
+
+// ReportUserTrafficBatch 上报一批带批次号的流量；重试时传入同一个 batch
+func (c *ClientV1) ReportUserTrafficBatch(ctx context.Context, b *HTTPTrafficBatch) error {
+	return c.pushTraffic(ctx, ServerPushUserTrafficRequest{
+		Traffic:    b.Traffic,
+		BootID:     b.BootID,
+		Sequence:   b.Sequence,
+		ReportedAt: b.ReportedAt,
+	})
 }
 
 type UserTraffic struct {
@@ -138,10 +194,13 @@ func (c *ClientV1) ReportUserTraffic(ctx context.Context, userTraffic *[]UserTra
 			Download: t.Download,
 		})
 	}
-	p := "/v1/server/push"
-	req := ServerPushUserTrafficRequest{
+	return c.pushTraffic(ctx, ServerPushUserTrafficRequest{
 		Traffic: traffic,
-	}
+	})
+}
+
+func (c *ClientV1) pushTraffic(ctx context.Context, req ServerPushUserTrafficRequest) error {
+	p := "/v1/server/push"
 	r, err := c.Client.R().
 		SetContext(ctx).
 		SetBody(req).

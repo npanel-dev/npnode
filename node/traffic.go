@@ -19,9 +19,12 @@ type trafficBatch struct {
 	users    map[int]panel.UserTraffic
 	reportID string
 	inflight []panel.UserTraffic
+	// http 已发出、尚未确认的 HTTP 批次（Api.TrafficIdempotent，T3）：必须原样重发，不与新流量合并
+	http *panel.HTTPTrafficBatch
 }
 
-// HTTP retries provide at-least-once delivery. Sync retries preserve the report
+// HTTP retries provide at-least-once delivery (with Api.TrafficIdempotent they keep
+// the same boot_id/sequence and payload, like Sync). Sync retries preserve the report
 // ID and payload for panel deduplication. Both queues survive configuration reloads.
 type trafficQueue struct {
 	mu       sync.Mutex
@@ -74,15 +77,32 @@ func (q *trafficQueue) reportVia(ctx context.Context, current *panel.ClientV1, g
 		useSync := gc != nil && gc.IsSyncConnected() && current != nil &&
 			key.host == current.APIHost && key.secret == current.SecretKey && key.id == current.NodeId
 		var err error
-		if useSync {
+		if batch.http != nil {
+			// 上一次 HTTP 批次未确认：先用同一批次号、同一内容重发，确认后才发后面的流量
+			if err = batch.client.ReportUserTrafficBatch(ctx, batch.http); err == nil {
+				batch.http = nil
+			}
+		}
+		// 保持顺序：未确认的 HTTP 批次重发失败时，之后的流量留到下一轮
+		if err == nil && useSync {
 			err = batch.reportSync(gc)
-		} else {
+		} else if err == nil {
 			traffic = make([]panel.UserTraffic, 0, len(batch.users))
 			for _, value := range batch.users {
 				traffic = append(traffic, value)
 			}
 			if len(traffic) > 0 {
-				err = batch.client.ReportUserTraffic(ctx, &traffic)
+				if panel.TrafficIdempotentEnabled() {
+					// 冻结成一个批次：失败后原样重发，新采集的流量进下一批
+					batch.http = panel.NewHTTPTrafficBatch(traffic)
+					batch.users = make(map[int]panel.UserTraffic)
+					traffic = nil
+					if err = batch.client.ReportUserTrafficBatch(ctx, batch.http); err == nil {
+						batch.http = nil
+					}
+				} else {
+					err = batch.client.ReportUserTraffic(ctx, &traffic)
+				}
 			}
 			if batch.reportID != "" {
 				// Keep the possibly accepted Sync report for an idempotent retry,
@@ -94,7 +114,7 @@ func (q *trafficQueue) reportVia(ctx context.Context, current *panel.ClientV1, g
 			}
 		}
 		if err != nil {
-			if batch.reportID == "" {
+			if batch.reportID == "" && batch.http == nil {
 				q.add(batch.client, traffic)
 			} else {
 				q.mu.Lock()
