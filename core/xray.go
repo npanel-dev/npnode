@@ -197,6 +197,10 @@ func (c *XrayCore) ServerConfigMonitor(ctx context.Context) (err error) {
 		log.WithField("err", err).Error("获取服务端配置失败")
 		return nil
 	}
+	if newServerConfig == nil {
+		// 配置没变：上次升级因网络问题失败的，退避时间到了就重试
+		upgrade.Retry()
+	}
 	if newServerConfig != nil {
 		// 配置里带了远程升级请求：先升级（成功时进程被新版本替换），失败则照常重载
 		upgrade.Check(newServerConfig)
