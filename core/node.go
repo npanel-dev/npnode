@@ -14,11 +14,11 @@ func (v *XrayCore) AddNode(tag string, info *panel.NodeInfo) error {
 	}
 	inBoundConfig, err := buildInbound(info, tag)
 	if err != nil {
-		return fmt.Errorf("build inbound error: %s", err)
+		return fmt.Errorf("build inbound error: %w", err)
 	}
 	err = v.addInbound(inBoundConfig)
 	if err != nil {
-		return fmt.Errorf("add inbound error: %s", err)
+		return fmt.Errorf("add inbound error: %w", err)
 	}
 	return nil
 }

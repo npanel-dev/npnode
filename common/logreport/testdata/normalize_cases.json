@@ -1,0 +1,16 @@
+[
+  {"in": "dial tcp 1.2.3.4:443: i/o timeout", "out": "dial tcp <ip>: i/o timeout"},
+  {"in": "user 3f2b1c9e-1a2b-4c3d-9e8f-001122334455 not found", "out": "user <uuid> not found"},
+  {"in": "got 12 users, version 345", "out": "got <n> users, version <n>"},
+  {"in": "read \"abc def\" failed", "out": "read \"?\" failed"},
+  {"in": "hash deadbeefcafe1234 mismatch", "out": "hash <hex> mismatch"},
+  {"in": "  a   b  ", "out": "a b"},
+  {"in": "dial tcp [2001:db8::1]:8443: refused", "out": "dial tcp <ip>: refused"},
+  {"in": "listen 0.0.0.0 failed", "out": "listen <ip> failed"},
+  {"in": "open \"/etc/x\" and \"y\"", "out": "open \"?\" and \"?\""},
+  {"in": "id 1234567890 bad", "out": "id <hex> bad"},
+  {"in": "user 3F2B1C9E-1A2B-4C3D-9E8F-001122334455 x", "out": "user <uuid> x"},
+  {"in": "dial tcp [::1] refused", "out": "dial tcp <ip> refused"},
+  {"in": "got \"3f2b1c9e-1a2b-4c3d-9e8f-001122334455 1.2.3.4\" bad", "out": "got \"?\" bad"},
+  {"in": "a\tb\n\nc\r\nd", "out": "a b c d"}
+]

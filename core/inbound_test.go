@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/npanel-dev/npnode/api/panel"
+	"github.com/npanel-dev/npnode/common/logreport"
 	coreConf "github.com/xtls/xray-core/infra/conf"
 	xtls "github.com/xtls/xray-core/transport/internet/tls"
 )
@@ -145,5 +146,28 @@ func TestApplyQUICALPNKeepsExplicitALPN(t *testing.T) {
 	applyQUICALPN("hysteria", tlsSettings)
 	if got := *tlsSettings.ALPN; len(got) != 1 || got[0] != "custom" {
 		t.Fatalf("explicit ALPN overwritten: %v", got)
+	}
+}
+
+// vlessDecryption 三处错误带有错误码
+func TestVlessDecryptionCodes(t *testing.T) {
+	cases := []struct {
+		name string
+		p    *panel.Protocol
+		want string
+	}{
+		{"模式为空", &panel.Protocol{Encryption: "mlkem768x25519plus", EncryptionMode: ""}, logreport.CodeVlessEncModeEmpty},
+		{"私钥为空", &panel.Protocol{Encryption: "mlkem768x25519plus", EncryptionMode: "native"}, logreport.CodeVlessEncKeyEmpty},
+		{"不支持的加密", &panel.Protocol{Encryption: "foo"}, logreport.CodeVlessEncUnsupported},
+	}
+	for _, c := range cases {
+		_, err := vlessDecryption(c.p)
+		if err == nil {
+			t.Fatalf("%s: 应报错", c.name)
+		}
+		code, stage, _, _, ok := logreport.Classify(err)
+		if !ok || code != c.want || stage != logreport.StageInbound {
+			t.Fatalf("%s: code=%q stage=%q ok=%v, 期望 %q/inbound", c.name, code, stage, ok, c.want)
+		}
 	}
 }

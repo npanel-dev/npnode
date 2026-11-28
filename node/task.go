@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/npanel-dev/npnode/api/panel"
+	"github.com/npanel-dev/npnode/common/logreport"
 	"github.com/npanel-dev/npnode/common/serverstatus"
 	"github.com/npanel-dev/npnode/common/task"
 	log "github.com/sirupsen/logrus"
@@ -263,7 +264,7 @@ func (c *Controller) flushPendingTraffic(ctx context.Context, useSync bool) {
 		gc = c.grpcClient
 	}
 	if err := c.traffic.reportVia(ctx, c.apiClient, gc); err != nil {
-		log.WithFields(log.Fields{"tag": c.tag, "err": err}).Warn("上报用户流量失败，保留到下一轮重试")
+		log.WithFields(log.Fields{"tag": c.tag, "err": logreport.Wrap(logreport.CodeTrafficReport, logreport.StageReport, err)}).Warn("上报用户流量失败，保留到下一轮重试")
 	}
 }
 

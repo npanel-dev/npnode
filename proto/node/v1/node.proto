@@ -160,6 +160,7 @@ message SyncRequest {
     Subscribe subscribe = 4;
     // 入站证书状态（http / dns 模式申请 / 续期的结果）
     CertReport cert = 5;
+    LogReport log = 6;
   }
 }
 
@@ -173,6 +174,36 @@ message CertReport {
   string error = 6;      // 失败原因；续期失败但旧证书仍有效时 ok=true 且带 error
   int64 not_after = 7;   // 证书到期时间（unix 秒），没有证书为 0
   int64 checked_at = 8;  // 节点检查时间（unix 秒）
+}
+
+// LogReport 一批节点故障事件与恢复信号
+message LogReport {
+  repeated LogEvent events = 1;
+  string report_id = 2;   // 面板按 report_id 去重并回 Ack，未 Ack 用同一 ID 重发（同流量上报）
+  repeated LogResolve resolves = 3;
+}
+
+// LogResolve 恢复信号：某个范围内的问题已经好了，面板把对应的未恢复事件标记为已恢复
+message LogResolve {
+  string scope = 1;       // server：节点整体启动成功；inbound：某入站启动成功；cert：某入站证书可用
+  string protocol = 2;    // scope 为 inbound / cert 时必填
+  uint32 port = 3;
+  repeated string active_inbounds = 4; // scope=server 时附当前已启动的入站 "protocol:port"
+  int64 resolved_at = 5;  // unix 毫秒
+}
+
+message LogEvent {
+  string level = 1;       // error / warn / fatal
+  string code = 2;        // 稳定错误码，如 VLESS_ENCRYPTION_MODE_EMPTY；无法归类为 UNKNOWN
+  string stage = 3;       // config / core / inbound / cert / report / runtime
+  string protocol = 4;    // 关联入站，可空
+  uint32 port = 5;
+  string message = 6;     // 原始错误文本（已脱敏）
+  repeated string context = 7; // 事件前后的原始日志行（已脱敏，最多 50 行）
+  int64 occurred_at = 8;  // unix 毫秒
+  string version = 9;     // 节点版本
+  bool exiting = 10;      // 节点因此事件退出
+  uint32 count = 11;      // 节点节流窗口内该事件累计次数（≥1），面板 count += count
 }
 
 message Subscribe {

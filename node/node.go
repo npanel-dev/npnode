@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/npanel-dev/npnode/api/panel"
+	"github.com/npanel-dev/npnode/common/logreport"
 	"github.com/npanel-dev/npnode/common/serverstatus"
 	"github.com/npanel-dev/npnode/common/task"
 	"github.com/npanel-dev/npnode/conf"
@@ -123,8 +124,10 @@ func (n *Node) Start() error {
 	if len(n.controllers) == 0 {
 		n.startServerStatusTask()
 		log.Info("服务器还没有协议，已对接面板，暂不启动入站")
+		logreport.Resolve(logreport.ScopeServer, "", 0, []string{})
 		return nil
 	}
+	active := []string{}
 	for i := range n.controllers {
 		if !n.controllers[i].info.Protocol.Enable {
 			continue
@@ -132,18 +135,22 @@ func (n *Node) Start() error {
 		err := n.controllers[i].Start()
 		if errors.Is(err, errCertPending) {
 			// 证书不可用的入站不启动，其他入站照常运行；失败原因已同步给面板，之后自动重试
-			log.WithFields(log.Fields{"协议": n.controllers[i].info.Type, "端口": n.controllers[i].info.Protocol.Port, "err": err}).Error("入站因证书不可用暂不启动")
+			certErr := logreport.WithInbound(logreport.Wrap(logreport.CodeCertUnavailable, logreport.StageCert, err),
+				n.controllers[i].info.Type, n.controllers[i].info.Protocol.Port)
+			log.WithFields(log.Fields{"协议": n.controllers[i].info.Type, "端口": n.controllers[i].info.Protocol.Port, "err": certErr}).Error("入站因证书不可用暂不启动")
 			continue
 		}
 		if err != nil {
-			return fmt.Errorf("启动节点 [%s-%s-%d-%d] 失败: %s",
+			return logreport.WithInbound(fmt.Errorf("启动节点 [%s-%s-%d-%d] 失败: %w",
 				n.controllers[i].apiClient.APIHost,
 				n.controllers[i].info.Type,
 				n.controllers[i].info.Id,
 				n.controllers[i].info.Protocol.Port,
-				err)
+				err), n.controllers[i].info.Type, n.controllers[i].info.Protocol.Port)
 		}
+		active = append(active, fmt.Sprintf("%s:%d", n.controllers[i].info.Type, n.controllers[i].info.Protocol.Port))
 	}
+	logreport.Resolve(logreport.ScopeServer, "", 0, active)
 	return nil
 }
 
@@ -189,7 +196,7 @@ func (n *Node) reportServerStatus(ctx context.Context) error {
 		err = n.statusClient.ReportServerStatus(&panel.NodeStatus{CPU: cpu, Mem: mem, Disk: disk, Uptime: uptime})
 	}
 	if err != nil {
-		log.WithField("err", err).Info("Report server status failed")
+		log.WithField("err", logreport.Wrap(logreport.CodeStatusReport, logreport.StageReport, err)).Warn("Report server status failed")
 	}
 	return nil
 }

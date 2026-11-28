@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net/url"
@@ -50,6 +51,13 @@ type GrpcClient struct {
 	// certReports 各入站最近一次证书状态；流连上（收到 Hello）时全部补发
 	certMu      sync.Mutex
 	certReports map[string]*nodev1.CertReport
+
+	// 日志通道兼容旧面板：等待日志 Ack 超时（旧面板不认识该 payload，不回 Ack）后，
+	// 在 logOffUntil 之前不再经 gRPC 发日志，直接走 HTTP。以下字段为零值时使用默认值，供测试注入。
+	logAckTimeout time.Duration    // 默认 syncAckTimeout
+	logDisableFor time.Duration    // 默认 logDisableDuration
+	now           func() time.Time // 默认 time.Now
+	logOffUntil   time.Time        // 受 mu 保护
 }
 
 // parseGrpcAddr parses a URL-style address into a gRPC target and TLS status.
@@ -303,6 +311,12 @@ func (g *GrpcClient) Subscribe(inbounds ...Inbound) error {
 // syncAckTimeout 等待面板 Ack 的最长时间
 const syncAckTimeout = 15 * time.Second
 
+// logDisableDuration 日志 Ack 超时后关闭 gRPC 日志通道的时长（旧面板不认识日志 payload，不回 Ack）
+const logDisableDuration = 10 * time.Minute
+
+// errAckTimeout 等待 Ack 超时
+var errAckTimeout = errors.New("timed out waiting for ack")
+
 // NewTrafficReportID 生成流量上报 ID：本进程启动标识 + 自增序号。
 // 节点未收到成功 Ack 时用同一个 ID 重发，面板据此去重，不会重复计费。
 func (g *GrpcClient) NewTrafficReportID() string {
@@ -367,6 +381,16 @@ func (g *GrpcClient) SendTraffic(reportID, protocol string, port int, traffic []
 	report.Port = clampPort(port)
 	report.ReportId = reportID
 
+	return g.sendWithAck(reportID, &nodev1.SyncRequest{Payload: &nodev1.SyncRequest_Traffic{Traffic: report}})
+}
+
+// sendWithAck 经 Sync 发送 req 并等待 reportID 对应的 Ack（固定超时 syncAckTimeout）。
+func (g *GrpcClient) sendWithAck(reportID string, req *nodev1.SyncRequest) error {
+	return g.sendWithAckCtx(context.Background(), reportID, req, "traffic", syncAckTimeout)
+}
+
+// sendWithAckCtx 同 sendWithAck，但额外在 ctx 结束时立即返回；kind 仅用于错误文案，timeout 为等待 Ack 的时长。
+func (g *GrpcClient) sendWithAckCtx(ctx context.Context, reportID string, req *nodev1.SyncRequest, kind string, timeout time.Duration) error {
 	waiter := make(chan *nodev1.Ack, 1)
 	g.mu.Lock()
 	if g.ackWaiters == nil {
@@ -380,10 +404,10 @@ func (g *GrpcClient) SendTraffic(reportID, protocol string, port int, traffic []
 		g.mu.Unlock()
 	}()
 
-	if err := g.sendSync(&nodev1.SyncRequest{Payload: &nodev1.SyncRequest_Traffic{Traffic: report}}); err != nil {
+	if err := g.sendSync(req); err != nil {
 		return err
 	}
-	timer := time.NewTimer(syncAckTimeout)
+	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	select {
 	case ack := <-waiter:
@@ -391,12 +415,58 @@ func (g *GrpcClient) SendTraffic(reportID, protocol string, port int, traffic []
 			return fmt.Errorf("sync stream closed before ack")
 		}
 		if !ack.GetOk() {
-			return fmt.Errorf("panel rejected traffic report %s: %s", reportID, ack.GetError())
+			return fmt.Errorf("panel rejected %s report %s: %s", kind, reportID, ack.GetError())
 		}
 		return nil
 	case <-timer.C:
-		return fmt.Errorf("timed out waiting for ack of traffic report %s", reportID)
+		return fmt.Errorf("%w of %s report %s", errAckTimeout, kind, reportID)
+	case <-ctx.Done():
+		return fmt.Errorf("waiting for ack of %s report %s: %w", kind, reportID, ctx.Err())
 	}
+}
+
+// SendLogs 经 Sync 上报一批节点日志并等待面板 Ack；ctx 结束时立即返回。
+// 等待 Ack 超时视为面板不支持日志 payload：本进程内关闭 gRPC 日志通道 logDisableFor，
+// 期间直接返回错误（LogSender 改走 HTTP），流量等其它 Sync 上报不受影响。
+func (g *GrpcClient) SendLogs(ctx context.Context, r *nodev1.LogReport) error {
+	if r.GetReportId() == "" {
+		return fmt.Errorf("report id is required")
+	}
+	if !g.logsEnabled() {
+		return errLogsDisabled
+	}
+	timeout := g.logAckTimeout
+	if timeout <= 0 {
+		timeout = syncAckTimeout
+	}
+	err := g.sendWithAckCtx(ctx, r.GetReportId(), &nodev1.SyncRequest{Payload: &nodev1.SyncRequest_Log{Log: r}}, "log", timeout)
+	if errors.Is(err, errAckTimeout) {
+		d := g.logDisableFor
+		if d <= 0 {
+			d = logDisableDuration
+		}
+		g.mu.Lock()
+		g.logOffUntil = g.nowTime().Add(d)
+		g.mu.Unlock()
+	}
+	return err
+}
+
+// errLogsDisabled gRPC 日志通道处于关闭期
+var errLogsDisabled = errors.New("grpc log channel disabled after ack timeout")
+
+// logsEnabled 返回 gRPC 日志通道当前是否可用（不在 Ack 超时后的关闭期内）。
+func (g *GrpcClient) logsEnabled() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return !g.nowTime().Before(g.logOffUntil)
+}
+
+func (g *GrpcClient) nowTime() time.Time {
+	if g.now != nil {
+		return g.now()
+	}
+	return time.Now()
 }
 
 // deliverAck 把面板 Ack 交给等待中的 SendTraffic
