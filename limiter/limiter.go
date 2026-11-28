@@ -10,6 +10,7 @@ import (
 	"github.com/juju/ratelimit"
 	"github.com/npanel-dev/npnode/api/panel"
 	"github.com/npanel-dev/npnode/common/format"
+	"github.com/npanel-dev/npnode/common/rate"
 )
 
 var limitLock sync.RWMutex
@@ -30,7 +31,7 @@ type Limiter struct {
 	OldUserOnline *sync.Map      // Key: Ip, value: Uid
 	UUIDtoUID     map[string]int // Key: UUID, value: Uid
 	UserLimitInfo *sync.Map      // Key: TagUUID, value: UserLimitInfo
-	SpeedLimiter  *sync.Map      // key: TagUUID, value: *ratelimit.Bucket
+	SpeedLimiter  *sync.Map      // key: TagUUID, value: *rate.Bucket（间接层，U5 原地替换）
 	AliveList     map[int]int    // Key: Uid, value: alive_ip
 	// BitPerSecond 声明了 seat_v1：speed_limit 按 bit/s 解释；否则按旧口径 Mbps 解释
 	BitPerSecond bool
@@ -122,7 +123,38 @@ func (l *Limiter) UpdateUser(tag string, added []panel.UserInfo, deleted []panel
 	}
 }
 
-func (l *Limiter) CheckLimit(taguuid string, ip string, isTcp bool, noSSUDP bool) (Bucket *ratelimit.Bucket, Reject bool) {
+// UpdateUserLimit 原地更新用户的限速和设备数（U5）：替换 UserLimitInfo，并替换已有 bucket 间接层里的 bucket，
+// 已有连接下一次写入即按新速率；不删用户、不断连接。用户不在限速器里时什么都不做。
+// 动态限速（DynamicSpeedLimit / ExpireTime）原样保留。
+func (l *Limiter) UpdateUserLimit(taguuid string, speedLimit, deviceLimit int) {
+	v, ok := l.UserLimitInfo.Load(taguuid)
+	if !ok {
+		return
+	}
+	nu := *v.(*UserLimitInfo)
+	nu.SpeedLimit = speedLimit
+	nu.DeviceLimit = deviceLimit
+	l.UserLimitInfo.Store(taguuid, &nu)
+	ref, ok := l.SpeedLimiter.Load(taguuid)
+	if !ok {
+		return // 还没有连接建立过 bucket，下一次 CheckLimit 按新值建立
+	}
+	userLimit := nu.SpeedLimit
+	if nu.ExpireTime == 0 || nu.ExpireTime >= time.Now().Unix() {
+		userLimit = determineSpeedLimit(nu.SpeedLimit, nu.DynamicSpeedLimit)
+	}
+	ref.(*rate.Bucket).Store(newUserBucket(speedLimitBytesPerSecond(determineSpeedLimit(l.SpeedLimit, userLimit), l.BitPerSecond)))
+}
+
+// newUserBucket 字节每秒为 limit 的 bucket；limit <= 0 表示不限速，返回 nil
+func newUserBucket(limit int64) *ratelimit.Bucket {
+	if limit <= 0 {
+		return nil
+	}
+	return ratelimit.NewBucketWithQuantum(time.Second, limit, limit) // Byte/s
+}
+
+func (l *Limiter) CheckLimit(taguuid string, ip string, isTcp bool, noSSUDP bool) (Bucket *rate.Bucket, Reject bool) {
 	// check if ipv4 mapped ipv6
 	ip = strings.TrimPrefix(ip, "::ffff:")
 
@@ -182,13 +214,17 @@ func (l *Limiter) CheckLimit(taguuid string, ip string, isTcp bool, noSSUDP bool
 
 	limit := speedLimitBytesPerSecond(determineSpeedLimit(nodeLimit, userLimit), l.BitPerSecond)
 	if limit > 0 {
-		Bucket = ratelimit.NewBucketWithQuantum(time.Second, limit, limit) // Byte/s
-		if v, ok := l.SpeedLimiter.LoadOrStore(taguuid, Bucket); ok {
-			return v.(*ratelimit.Bucket), false
-		} else {
-			l.SpeedLimiter.Store(taguuid, Bucket)
-			return Bucket, false
+		// 同一用户的连接共用一个间接层：首次建立后沿用（与原先缓存 bucket 的行为一致），
+		// 间接层里为空（U5 改成过不限速）时按本次计算的速率补上
+		if v, ok := l.SpeedLimiter.Load(taguuid); ok {
+			ref := v.(*rate.Bucket)
+			if ref.Load() == nil {
+				ref.Store(newUserBucket(limit))
+			}
+			return ref, false
 		}
+		v, _ := l.SpeedLimiter.LoadOrStore(taguuid, rate.NewBucket(newUserBucket(limit)))
+		return v.(*rate.Bucket), false
 	} else {
 		return nil, false
 	}
