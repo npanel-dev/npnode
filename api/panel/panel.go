@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -32,6 +33,10 @@ type ClientV2 struct {
 	ServerId         int
 	ServerConfigEtag string
 	responseBodyHash string
+
+	// 日志上报专用客户端（不挂 OnError），首次使用时创建
+	logClientOnce sync.Once
+	logClient     *resty.Client
 }
 
 func NewClientV1(c *conf.NodeApiConfig) (*ClientV1, error) {

@@ -367,6 +367,16 @@ func (g *GrpcClient) SendTraffic(reportID, protocol string, port int, traffic []
 	report.Port = clampPort(port)
 	report.ReportId = reportID
 
+	return g.sendWithAck(reportID, &nodev1.SyncRequest{Payload: &nodev1.SyncRequest_Traffic{Traffic: report}})
+}
+
+// sendWithAck 经 Sync 发送 req 并等待 reportID 对应的 Ack（固定超时 syncAckTimeout）。
+func (g *GrpcClient) sendWithAck(reportID string, req *nodev1.SyncRequest) error {
+	return g.sendWithAckCtx(context.Background(), reportID, req, "traffic")
+}
+
+// sendWithAckCtx 同 sendWithAck，但额外在 ctx 结束时立即返回；kind 仅用于错误文案。
+func (g *GrpcClient) sendWithAckCtx(ctx context.Context, reportID string, req *nodev1.SyncRequest, kind string) error {
 	waiter := make(chan *nodev1.Ack, 1)
 	g.mu.Lock()
 	if g.ackWaiters == nil {
@@ -380,7 +390,7 @@ func (g *GrpcClient) SendTraffic(reportID, protocol string, port int, traffic []
 		g.mu.Unlock()
 	}()
 
-	if err := g.sendSync(&nodev1.SyncRequest{Payload: &nodev1.SyncRequest_Traffic{Traffic: report}}); err != nil {
+	if err := g.sendSync(req); err != nil {
 		return err
 	}
 	timer := time.NewTimer(syncAckTimeout)
@@ -391,12 +401,22 @@ func (g *GrpcClient) SendTraffic(reportID, protocol string, port int, traffic []
 			return fmt.Errorf("sync stream closed before ack")
 		}
 		if !ack.GetOk() {
-			return fmt.Errorf("panel rejected traffic report %s: %s", reportID, ack.GetError())
+			return fmt.Errorf("panel rejected %s report %s: %s", kind, reportID, ack.GetError())
 		}
 		return nil
 	case <-timer.C:
-		return fmt.Errorf("timed out waiting for ack of traffic report %s", reportID)
+		return fmt.Errorf("timed out waiting for ack of %s report %s", kind, reportID)
+	case <-ctx.Done():
+		return fmt.Errorf("waiting for ack of %s report %s: %w", kind, reportID, ctx.Err())
 	}
+}
+
+// SendLogs 经 Sync 上报一批节点日志并等待面板 Ack；ctx 结束时立即返回。
+func (g *GrpcClient) SendLogs(ctx context.Context, r *nodev1.LogReport) error {
+	if r.GetReportId() == "" {
+		return fmt.Errorf("report id is required")
+	}
+	return g.sendWithAckCtx(ctx, r.GetReportId(), &nodev1.SyncRequest{Payload: &nodev1.SyncRequest_Log{Log: r}}, "log")
 }
 
 // deliverAck 把面板 Ack 交给等待中的 SendTraffic
