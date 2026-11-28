@@ -145,3 +145,32 @@ func TestOldPanelBoundedAttemptsPerHour(t *testing.T) {
 		t.Fatalf("应落盘: %v %s", err, data)
 	}
 }
+
+func TestReportLogsStatusClassification(t *testing.T) {
+	for _, tc := range []struct {
+		code     int
+		ok       bool
+		rejected bool
+	}{
+		{200, true, false},
+		{204, true, false},
+		{302, false, false},
+		{400, false, true},
+		{413, false, true},
+		{403, false, true},
+		{408, false, false},
+		{429, false, false},
+		{500, false, false},
+		{503, false, false},
+	} {
+		var hits atomic.Int32
+		c := newLogClient(t, statusServer(t, tc.code, &hits).URL)
+		err := c.ReportLogs(context.Background(), sampleLogReport())
+		if (err == nil) != tc.ok {
+			t.Fatalf("HTTP %d: 成功=%v，err=%v", tc.code, tc.ok, err)
+		}
+		if errors.Is(err, logreport.ErrRejected) != tc.rejected {
+			t.Fatalf("HTTP %d: 是否永久拒绝应为 %v，err=%v", tc.code, tc.rejected, err)
+		}
+	}
+}

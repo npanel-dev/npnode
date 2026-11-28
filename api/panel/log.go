@@ -67,14 +67,24 @@ func (c *ClientV2) ReportLogs(ctx context.Context, r *nodev1.LogReport) error {
 	if err != nil {
 		return fmt.Errorf("上报节点日志失败: %w", err)
 	}
-	switch code := resp.StatusCode(); {
+	return classifyLogStatus(resp.StatusCode())
+}
+
+// classifyLogStatus 按 HTTP 状态码分类上报结果：仅 2xx 成功；
+// 404/405（旧面板没有该接口）-> ErrUnsupported，交给 Reporter 长时间退避；
+// 其它 4xx（408/429 除外）-> ErrRejected，重发不会成功，Reporter 丢弃该批；
+// 3xx、408、429、5xx 等 -> 普通可重试错误。
+func classifyLogStatus(code int) error {
+	switch {
+	case code >= 200 && code < 300:
+		return nil
 	case code == http.StatusNotFound || code == http.StatusMethodNotAllowed:
-		// 旧面板没有该接口：交给 Reporter 长时间退避
 		return fmt.Errorf("%w: HTTP %d", logreport.ErrUnsupported, code)
-	case code >= 400:
+	case code >= 400 && code < 500 && code != http.StatusRequestTimeout && code != http.StatusTooManyRequests:
+		return fmt.Errorf("%w: 上报节点日志失败: HTTP %d", logreport.ErrRejected, code)
+	default:
 		return fmt.Errorf("上报节点日志失败: HTTP %d", code)
 	}
-	return nil
 }
 
 // SendLogs 实现 logreport.Sender（仅 HTTP）。

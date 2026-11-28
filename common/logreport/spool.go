@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/sirupsen/logrus"
 	"google.golang.org/protobuf/encoding/protojson"
 
 	nodev1 "github.com/npanel-dev/npnode/proto/node/v1"
@@ -183,7 +184,14 @@ func (r *Reporter) ReplaySpool(ctx context.Context) error {
 	defer func() { <-r.sem }()
 
 	for i, rep := range reports {
-		if err := s.SendLogs(ctx, rep); err != nil {
+		err := s.SendLogs(ctx, rep)
+		if errors.Is(err, ErrRejected) {
+			// 面板永久拒绝：丢弃该报告，继续重放后面的（只记 Debug，避免经 hook 回流）
+			logrus.WithField("err", err).Debugf("[log] 面板拒绝 spool 中的节点日志报告 %s，已丢弃", rep.ReportId)
+			continue
+		}
+		if err != nil {
+			// 剩余部分（不含已发送和已被拒绝的）写回
 			if werr := writeSpool(r.spoolPath, reports[i:]); werr != nil {
 				return errors.Join(err, werr)
 			}

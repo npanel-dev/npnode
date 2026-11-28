@@ -10,6 +10,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/sirupsen/logrus"
+
 	nodev1 "github.com/npanel-dev/npnode/proto/node/v1"
 )
 
@@ -47,6 +49,9 @@ var (
 	// ErrUnsupported 表示面板不支持节点日志上报（旧面板，HTTP 404/405）。
 	// Sender 返回包装了它的错误时，Reporter 保留数据并长时间退避（UnsupportedBackoff）。
 	ErrUnsupported = errors.New("logreport: 面板不支持节点日志上报")
+	// ErrRejected 表示面板永久拒绝了这批上报（HTTP 4xx，如 400/413），重发也不会成功。
+	// Sender 返回包装了它的错误时，Reporter 丢弃该批次并继续发送后续批次。
+	ErrRejected = errors.New("logreport: 面板拒绝了该批上报")
 )
 
 // Sender 负责把一批日志上报发送给面板（由 gRPC/HTTP 客户端实现）。
@@ -379,7 +384,13 @@ func (r *Reporter) flush(ctx context.Context, all bool) error {
 		if s == nil {
 			return errNoSender
 		}
-		if err := s.SendLogs(ctx, b); err != nil {
+		err := s.SendLogs(ctx, b)
+		if errors.Is(err, ErrRejected) {
+			// 面板永久拒绝：重发无意义，丢弃该批次继续发后面的（只记 Debug，避免经 hook 回流）
+			logrus.WithField("err", err).Debugf("[log] 面板拒绝节点日志批次 %s，已丢弃", b.ReportId)
+			err = nil
+		}
+		if err != nil {
 			// ctx 结束（退出预算用尽）不是面板的问题，不计入退避
 			if ctx.Err() == nil {
 				r.mu.Lock()
