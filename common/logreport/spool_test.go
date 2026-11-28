@@ -46,7 +46,8 @@ func TestFlushFatalTimeoutWritesSpoolWithinBudget(t *testing.T) {
 	if len(events) != 30 {
 		t.Fatalf("spool 事件数 = %d", len(events))
 	}
-	if len(reports) != 1 || reports[0].ReportId == "" || len(reports[0].Resolves) != 1 {
+	// 30 条按每批 20 条分为 2 批，resolve 附在最后一批
+	if len(reports) != 2 || reports[0].ReportId == "" || reports[1].ReportId == "" || len(reports[1].Resolves) != 1 {
 		t.Fatalf("spool 报告不符: %v", reports)
 	}
 }
@@ -122,10 +123,13 @@ func TestSpoolAppendPreservesExisting(t *testing.T) {
 func TestSpoolCappedAt1MB(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "spool.json")
 	r := NewReporter(Options{Sender: &fakeSender{fail: alwaysFail}, SpoolPath: path, Now: newClock().Now})
-	big := strings.Repeat("a", 4096)
+	// message 截断到 2000 字，靠上下文把单条撑到约 5 KB，400 条约 2 MB
+	big := strings.Repeat("a", 2000)
 	ctx := context.Background()
 	for i := 1; i <= 400; i++ {
-		r.Add(ev(CodeInboundStart, i, big))
+		e := ev(CodeInboundStart, i, big)
+		e.Context = []string{strings.Repeat("b", 1000), strings.Repeat("c", 1000), strings.Repeat("d", 1000)}
+		r.Add(e)
 		if i%100 == 0 {
 			_ = r.flush(ctx, false) // 形成多个批次
 		}

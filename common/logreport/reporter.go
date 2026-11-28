@@ -22,6 +22,16 @@ const (
 	batchTrigger = 20
 	// maxQueued 为内存中（暂扣 + 待发 + 未发批次）事件总数上限，超过丢最旧。
 	maxQueued = 500
+	// maxBatchEvents 为单批事件数上限。
+	maxBatchEvents = 20
+	// maxBatchBytes 为单批 protojson 序列化大小上限，远低于面板 gRPC 默认 4 MiB 接收上限。
+	maxBatchBytes = 1 << 20
+	// batchSlack 为估算批次大小时预留的余量（报告外壳、逗号、protojson 随机空白等）。
+	batchSlack = 16 << 10
+	// 单条事件截断上限（与面板一致）：message 字数、每行上下文字数、上下文行数。
+	maxMessageRunes     = 2000
+	maxContextLineRunes = 1000
+	maxContextLines     = 50
 )
 
 var (
@@ -47,6 +57,7 @@ type Options struct {
 type item struct {
 	key       string
 	ev        *nodev1.LogEvent
+	size      int // ev 的 protojson 序列化大小（用于分批）
 	holdUntil time.Time
 }
 
@@ -128,6 +139,8 @@ func (r *Reporter) Add(e *nodev1.LogEvent) {
 		e.Count = 1
 	}
 	fixEvent(e)
+	truncateEvent(e)
+	size := eventSize(e)
 	key := MergeKey(e.Code, e.Protocol, int(e.Port), e.Message)
 
 	r.mu.Lock()
@@ -141,8 +154,9 @@ func (r *Reporter) Add(e *nodev1.LogEvent) {
 		p.OccurredAt = e.OccurredAt
 		p.Level = e.Level
 		p.Exiting = e.Exiting
+		it.size = size
 	} else {
-		it := &item{key: key, ev: e}
+		it := &item{key: key, ev: e, size: size}
 		if last, ok := r.lastSent[key]; ok && now.Before(last.Add(throttleWindow)) {
 			it.holdUntil = last.Add(throttleWindow)
 		}
@@ -172,6 +186,44 @@ func fixEvent(e *nodev1.LogEvent) {
 	for i, l := range e.Context {
 		e.Context[i] = validUTF8(l)
 	}
+}
+
+// truncateEvent 按字符（rune，UTF-8 安全）截断过长的 message 与上下文，上下文超过行数时保留最近的行。
+func truncateEvent(e *nodev1.LogEvent) {
+	e.Message = truncRunes(e.Message, maxMessageRunes)
+	ctx := e.Context
+	if len(ctx) > maxContextLines {
+		ctx = ctx[len(ctx)-maxContextLines:]
+	}
+	out := make([]string, len(ctx))
+	for i, l := range ctx {
+		out[i] = truncRunes(l, maxContextLineRunes)
+	}
+	e.Context = out
+}
+
+// truncRunes 截断为至多 n 个字符。
+func truncRunes(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	i := 0
+	for pos := range s {
+		if i == n {
+			return s[:pos]
+		}
+		i++
+	}
+	return s
+}
+
+// eventSize 返回事件 protojson 序列化大小；失败时按 maxBatchBytes 处理（单独成批）。
+func eventSize(e *nodev1.LogEvent) int {
+	b, err := spoolMarshal.Marshal(e)
+	if err != nil {
+		return maxBatchBytes
+	}
+	return len(b)
 }
 
 // Resolve 记录一条恢复通知；同一 scope/protocol/port 只保留最新一条。
@@ -293,14 +345,16 @@ func (r *Reporter) flush(ctx context.Context, all bool) error {
 	}
 }
 
-// buildBatchLocked 把可发送（或 all 时全部）待发事件与 resolve 组成一个新批次。
+// buildBatchLocked 把可发送（或 all 时全部）待发事件与 resolve 组成新批次：
+// 每批不超过 maxBatchEvents 条且 protojson 大小不超过 maxBatchBytes（单条超限的事件单独成批），
+// resolve 附在最后一批上（放不下时单独成批）。
 func (r *Reporter) buildBatchLocked(all bool) {
 	now := r.now()
-	var evs []*nodev1.LogEvent
+	var sel []*item
 	kept := r.pending[:0]
 	for _, it := range r.pending {
 		if all || it.holdUntil.IsZero() || !now.Before(it.holdUntil) {
-			evs = append(evs, it.ev)
+			sel = append(sel, it)
 			delete(r.pendingKey, it.key)
 			r.lastSent[it.key] = now
 		} else {
@@ -319,21 +373,46 @@ func (r *Reporter) buildBatchLocked(all bool) {
 		}
 	}
 
-	if len(evs) == 0 && len(r.resolves) == 0 {
+	if len(sel) == 0 && len(r.resolves) == 0 {
 		return
 	}
 	// 没有事件且已有未发批次时，不单独为 resolve 建批：留在 resolveKey 中按键去重（数量有界），
 	// 等下一个事件批次或前面的批次发完再带出，避免 Sender 长期失败时批次无限累积。
 	// all（FlushFatal）时仍组批，保证 resolve 被发送或落盘。
-	if len(evs) == 0 && len(r.batches) > 0 && !all {
+	if len(sel) == 0 && len(r.batches) > 0 && !all {
 		return
 	}
-	r.batches = append(r.batches, &nodev1.LogReport{
-		ReportId: r.newID(),
-		Events:   evs,
-		Resolves: r.resolves,
-	})
-	r.batchEvs += len(evs)
+
+	budget := maxBatchBytes - batchSlack
+	var groups [][]*nodev1.LogEvent
+	var cur []*nodev1.LogEvent
+	curBytes := 0
+	for _, it := range sel {
+		if len(cur) > 0 && (len(cur) >= maxBatchEvents || curBytes+it.size+1 > budget) {
+			groups = append(groups, cur)
+			cur, curBytes = nil, 0
+		}
+		cur = append(cur, it.ev)
+		curBytes += it.size + 1
+	}
+	if len(cur) > 0 || len(r.resolves) > 0 {
+		// 最后一组放不下 resolve 时让 resolve 单独成批
+		if len(cur) > 0 && len(r.resolves) > 0 {
+			if rb, err := spoolMarshal.Marshal(&nodev1.LogReport{Resolves: r.resolves}); err != nil || curBytes+len(rb) > budget {
+				groups = append(groups, cur)
+				cur = nil
+			}
+		}
+		groups = append(groups, cur)
+	}
+	for i, evs := range groups {
+		b := &nodev1.LogReport{ReportId: r.newID(), Events: evs}
+		if i == len(groups)-1 {
+			b.Resolves = r.resolves
+		}
+		r.batches = append(r.batches, b)
+		r.batchEvs += len(evs)
+	}
 	r.resolves = nil
 	r.resolveKey = map[string]*nodev1.LogResolve{}
 }
