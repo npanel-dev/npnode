@@ -70,6 +70,10 @@ func (h *Hook) Fire(entry *logrus.Entry) error {
 	if code == "" {
 		code = CodeUnknown
 	}
+	// 未带阶段的事件统一归入 runtime，保证面板能按阶段自动恢复
+	if stage == "" {
+		stage = StageRuntime
+	}
 
 	msg := entry.Message
 	if e, ok := entry.Data["err"].(error); ok && e != nil {

@@ -123,6 +123,7 @@ HTTP 兜底：`POST /v1/server/log?server_id=&secret_key=`，body 为 `LogReport
      - `scope=inbound`：恢复该服务器同 `protocol+port` 的 `stage=inbound` 事件。
      - `scope=cert`：恢复该服务器同 `protocol+port` 的 `stage=cert` 事件（入站启动成功不代表证书问题已解决）。
      - `scope=server`：该服务器 `stage in (config, core, report, runtime)` 的事件，以及**协议端口不在 `active_inbounds` 且已不在面板该服务器协议配置中**的入站事件（入站被删除后其旧故障随之恢复）。
+     - 空 stage 或未知 stage 的事件按 runtime 处理（节点与面板两端都做此归一）。
    - **复发**：已恢复的事件再次上报时，`resolved_at` 置空、`count` 继续累加、`last_at` 更新，列表中重新出现在「未恢复」。
 2. **入口**：gRPC `grpc_node_sync.go` 新增 `case *nodev1.SyncRequest_Log`，HTTP `http_compat_server.go` 新增 `/v1/server/log`，共用 `handleNodeLog`。
 3. **错误码提示文案**：面板内置 `code → 中文标题 + 处理建议` 对照表（如 `VLESS_ENCRYPTION_MODE_EMPTY` → 「VLESS 加密模式未填写，请在协议设置中补全加密模式与私钥，或把加密改为 none」）。未知码显示原文。

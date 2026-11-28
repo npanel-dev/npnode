@@ -167,3 +167,27 @@ func TestRingWraps(t *testing.T) {
 		t.Fatalf("Last(2) = %v", g)
 	}
 }
+
+func TestEmptyStageDefaultsToRuntime(t *testing.T) {
+	c := &collector{}
+	l := newTestLogger(NewRing(100), c)
+	l.Error("boom")
+	if len(c.ev) != 1 {
+		t.Fatalf("事件数 = %d", len(c.ev))
+	}
+	if c.ev[0].Stage != StageRuntime {
+		t.Fatalf("Stage = %q, 期望 %q", c.ev[0].Stage, StageRuntime)
+	}
+}
+
+func TestExplicitStageKept(t *testing.T) {
+	c := &collector{}
+	l := newTestLogger(NewRing(100), c)
+	l.WithFields(logrus.Fields{"code": CodeReload, "stage": StageCore}).Error("x")
+	if len(c.ev) != 1 {
+		t.Fatalf("事件数 = %d", len(c.ev))
+	}
+	if c.ev[0].Stage != StageCore {
+		t.Fatalf("Stage = %q, 期望 %q", c.ev[0].Stage, StageCore)
+	}
+}
