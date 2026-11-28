@@ -47,3 +47,11 @@ func TestClassifyPlainError(t *testing.T) {
 		t.Fatal("nil should stay nil")
 	}
 }
+
+func TestClassifyThroughJoin(t *testing.T) {
+	err := errors.Join(errors.New("other"), fmt.Errorf("w: %w", Wrap(CodeCertUnavailable, StageCert, errors.New("no cert"))))
+	code, stage, _, _, ok := Classify(err)
+	if !ok || code != CodeCertUnavailable || stage != StageCert {
+		t.Fatalf("got %v %v %v", code, stage, ok)
+	}
+}

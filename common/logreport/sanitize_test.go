@@ -24,3 +24,32 @@ func TestSanitizeQuerySecretAndKeys(t *testing.T) {
 		t.Fatal(got)
 	}
 }
+
+func TestSanitizePrefixedAndEdges(t *testing.T) {
+	cases := map[string]string{
+		"a?client_secret=abc&x=1": "a?client_secret=<redacted>&x=1",
+		"x_secret_key=abc":        "x_secret_key=<redacted>",
+		"access_token=abc def":    "access_token=<redacted> def",
+		`{"secret_key": "zzz"}`:   `{"secret_key": "<redacted>"}`,
+		`{"client_secret":"zzz"}`: `{"client_secret":"<redacted>"}`,
+	}
+	for in, want := range cases {
+		if got := Sanitize(in); got != want {
+			t.Errorf("Sanitize(%q)=%q want %q", in, got, want)
+		}
+	}
+	k1 := strings.Repeat("a", 43)
+	k2 := strings.Repeat("B", 43)
+	if got := Sanitize(k1); got != "<key>" {
+		t.Error(got)
+	}
+	if got := Sanitize("k=" + k1); got != "k=<key>" {
+		t.Error(got)
+	}
+	if got := Sanitize(k1 + " " + k2); got != "<key> <key>" {
+		t.Error(got)
+	}
+	if got := Sanitize(strings.Repeat("a", 44)); got != strings.Repeat("a", 44) {
+		t.Error(got)
+	}
+}

@@ -61,6 +61,7 @@ func Wrap(code, stage string, err error) error {
 
 // WithInbound 给链上最内层 *Error 补充协议与端口（仅补缺失字段）；
 // 链上没有 *Error 时包一层 INBOUND_START_FAILED/inbound。
+// 注意：会原地修改最内层 *Error，调用方不得传入被复用的共享/哨兵 *Error。
 func WithInbound(err error, protocol string, port int) error {
 	if err == nil {
 		return nil

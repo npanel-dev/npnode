@@ -3,10 +3,10 @@ package logreport
 import "regexp"
 
 var (
-	// 查询串形式 secret_key=xxx（值到 & 或空白/引号结束）
-	reSecretQuery = regexp.MustCompile(`(?i)\b((?:secret_key|secret|token|password|passwd|api_key|apikey)=)[^&\s"']+`)
+	// 查询串形式 secret_key=xxx，允许前缀（client_secret=、access_token=），值到 & 或空白/引号结束，前缀保留
+	reSecretQuery = regexp.MustCompile(`(?i)([A-Za-z0-9_]*(?:secret_key|secret|token|password|passwd|api_key|apikey)=)[^&\s"']+`)
 	// JSON 形式 "secret_key":"xxx"
-	reSecretJSON = regexp.MustCompile(`(?i)("(?:secret_key|secret|token|password|passwd|api_key|apikey)"\s*:\s*")[^"]*(")`)
+	reSecretJSON = regexp.MustCompile(`(?i)("[A-Za-z0-9_]*(?:secret_key|secret|token|password|passwd|api_key|apikey)"\s*:\s*")[^"]*(")`)
 	// 43 位 base64url（x25519 密钥等），前后不得紧邻 base64url 字符
 	reKey43 = regexp.MustCompile(`(^|[^A-Za-z0-9_-])[A-Za-z0-9_-]{43}($|[^A-Za-z0-9_-])`)
 )
