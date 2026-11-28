@@ -567,17 +567,11 @@ func (g *GrpcClient) runSyncLoop(handler SyncHandler, done <-chan struct{}) {
 			continue
 		}
 
-		// 流建立后先观察一段时间再标记为可用：服务端拒绝（如 Unimplemented）时错误在第一次 Recv 才返回，
-		// 若立刻标记可用，这期间的流量上报会走这条流并丢失。
+		// 只有收到面板的第一条消息（连接建立后面板立即发 ServerHello）才把流标记为可用。
+		// 不能按「建立后一段时间没报错」判断：经反代（如 Cloudflare）时流可能一直挂着、什么也收不到，
+		// 若当成可用，心跳和流量都会发进这条流丢失，面板因收不到状态判节点离线。
 		connectedAt := time.Now()
-		var streamActive = true
-		markReady := time.AfterFunc(syncReadyDelay, func() {
-			g.mu.Lock()
-			if streamActive {
-				g.sync = stream
-			}
-			g.mu.Unlock()
-		})
+		gotMessage := false
 
 		log.Info("[grpc.Sync] stream opened")
 
@@ -616,11 +610,12 @@ func (g *GrpcClient) runSyncLoop(handler SyncHandler, done <-chan struct{}) {
 				break
 			}
 			// 收到服务端消息说明流可用
-			g.mu.Lock()
-			if streamActive && g.sync == nil {
+			if !gotMessage {
+				gotMessage = true
+				g.mu.Lock()
 				g.sync = stream
+				g.mu.Unlock()
 			}
-			g.mu.Unlock()
 
 			switch payload := resp.Payload.(type) {
 			case *nodev1.SyncResponse_UserUpdate:
@@ -646,11 +641,12 @@ func (g *GrpcClient) runSyncLoop(handler SyncHandler, done <-chan struct{}) {
 		}
 
 		close(streamDone)
-		markReady.Stop()
 		assembler.reset()
+		if !gotMessage && status.Code(recvErr) != codes.Unimplemented {
+			log.Warnf("[grpc.Sync] 流在 %s 内没有收到面板任何消息，期间状态和流量继续走 HTTP；请检查反代是否正确转发 gRPC 流", time.Since(connectedAt).Round(time.Second))
+		}
 
 		g.mu.Lock()
-		streamActive = false
 		g.sync = nil
 		g.mu.Unlock()
 		g.failAckWaiters()
@@ -662,8 +658,8 @@ func (g *GrpcClient) runSyncLoop(handler SyncHandler, done <-chan struct{}) {
 		case status.Code(recvErr) == codes.Unimplemented:
 			// 面板不支持 Sync：低频重试，避免每秒请求面板
 			delay = syncUnimplementedRetry
-		case time.Since(connectedAt) >= syncStableDuration:
-			// 稳定运行过一段时间后断开：从最小间隔重新开始退避
+		case gotMessage && time.Since(connectedAt) >= syncStableDuration:
+			// 正常工作过一段时间后断开：从最小间隔重新开始退避（一直收不到消息的流不算稳定）
 			unimplementedLogged = false
 			delay = backoff.BaseDelay
 		default:
@@ -674,8 +670,6 @@ func (g *GrpcClient) runSyncLoop(handler SyncHandler, done <-chan struct{}) {
 }
 
 const (
-	// syncReadyDelay 流建立后多久才视为可用（收到服务端消息会提前视为可用）
-	syncReadyDelay = 5 * time.Second
 	// syncStableDuration 流持续多久算稳定，断开后才重置退避
 	syncStableDuration = time.Minute
 	// syncUnimplementedRetry 面板不支持 Sync 时的重试间隔
