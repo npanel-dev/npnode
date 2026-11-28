@@ -2,6 +2,7 @@ package limiter
 
 import (
 	"errors"
+	"net"
 	"strings"
 	"sync"
 	"time"
@@ -15,7 +16,12 @@ var limitLock sync.RWMutex
 var limiter map[string]*Limiter
 
 func Init() {
+	limitLock.Lock()
 	limiter = map[string]*Limiter{}
+	limitLock.Unlock()
+	connTablesMu.Lock()
+	connTables = map[string]*ConnTable{}
+	connTablesMu.Unlock()
 }
 
 type Limiter struct {
@@ -28,6 +34,8 @@ type Limiter struct {
 	AliveList     map[int]int    // Key: Uid, value: alive_ip
 	// BitPerSecond 声明了 seat_v1：speed_limit 按 bit/s 解释；否则按旧口径 Mbps 解释
 	BitPerSecond bool
+	// Conns 声明了 online_v1：活跃连接表，在线上报按它输出；未声明时为 nil，在线口径与旧版一致
+	Conns *ConnTable
 }
 
 type UserLimitInfo struct {
@@ -48,6 +56,9 @@ func AddLimiter(tag string, users []panel.UserInfo, aliveList map[int]int) *Limi
 		AliveList:     aliveList,
 		OldUserOnline: new(sync.Map),
 		BitPerSecond:  panel.SeatV1Enabled(),
+	}
+	if panel.OnlineV1Enabled() {
+		info.Conns = connTableFor(tag)
 	}
 	uuidmap := make(map[string]int)
 	for i := range users {
@@ -200,7 +211,54 @@ func speedLimitBytesPerSecond(speedLimit int, bitPerSecond bool) int64 {
 	return limit
 }
 
+// ActiveOnline 在线上报是否按活跃连接口径（online_v1）
+func (l *Limiter) ActiveOnline() bool {
+	return l.Conns != nil
+}
+
+// OpenConn 把一条已通过 CheckLimit 的链路登记到活跃连接表，返回释放函数（可重复、并发调用，只生效一次）。
+// 未声明 online_v1、用户不在限速器里、uid 无效或 IP 无法解析时返回 nil，不登记。
+// ip 与 CheckLimit 用同一个来源（已按可信 XFF / PROXY protocol 解析后的地址），去掉 IPv4 映射前缀。
+func (l *Limiter) OpenConn(taguuid string, ip string) (release func()) {
+	if l.Conns == nil {
+		return nil
+	}
+	ip = strings.TrimPrefix(ip, "::ffff:")
+	if net.ParseIP(ip) == nil {
+		return nil
+	}
+	v, ok := l.UserLimitInfo.Load(taguuid)
+	if !ok {
+		return nil
+	}
+	uid := v.(*UserLimitInfo).UID
+	if uid <= 0 {
+		return nil
+	}
+	return l.Conns.Open(uid, ip)
+}
+
+// GetOnlineDevice 本周期的在线 (uid, ip)。
+// 声明 online_v1 时返回活跃连接表的快照（含长连接、空闲连接和本周期的短连接，每个 uid 最多 64 个 IP）；
+// 否则保持旧口径：本周期新建连接时登记的 IP，读出后清空。
+// 两种口径都会执行旧的读出清空，保证 CheckLimit 的设备数判断（OldUserOnline）与旧版一致，表也不会无限增长。
 func (l *Limiter) GetOnlineDevice() (*[]panel.OnlineUser, error) {
+	legacy := l.drainLegacyOnline()
+	if l.Conns != nil {
+		snapshot := l.Conns.Snapshot(MaxOnlineIPsPerUID)
+		return &snapshot, nil
+	}
+	return legacy, nil
+}
+
+// RestoreOnline 在线上报失败：online_v1 口径下把这次读出的结果放回活跃连接表，下一周期补报；旧口径不做任何事（与旧版一致）
+func (l *Limiter) RestoreOnline(users []panel.OnlineUser) {
+	if l.Conns != nil {
+		l.Conns.Restore(users)
+	}
+}
+
+func (l *Limiter) drainLegacyOnline() *[]panel.OnlineUser {
 	var onlineUser []panel.OnlineUser
 	l.UserOnlineIP.Range(func(key, value interface{}) bool {
 		taguuid := key.(string)
@@ -216,7 +274,7 @@ func (l *Limiter) GetOnlineDevice() (*[]panel.OnlineUser, error) {
 		return true
 	})
 
-	return &onlineUser, nil
+	return &onlineUser
 }
 
 type UserIpList struct {

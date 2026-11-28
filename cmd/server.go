@@ -87,6 +87,8 @@ func serverHandle(_ *cobra.Command, _ []string) {
 	limiter.Init()
 	// 能力声明必须在创建任何面板客户端之前设置，同一进程内所有请求声明同一组能力
 	panel.SetSeatV1(c.ApiConfig.SeatV1)
+	panel.SetOnlineV1(c.ApiConfig.OnlineV1)
+	panel.SetTrafficIdempotent(c.ApiConfig.TrafficIdempotent)
 	p := panel.NewClientV2(&c.ApiConfig)
 	serverconfig, err := panel.GetServerConfig(context.Background(), p)
 	if err != nil {
@@ -201,6 +203,8 @@ func reload(config string, nodes **node.Node, xcore **core.XrayCore, grpcClient 
 		return err
 	}
 	panel.SetSeatV1(newConf.ApiConfig.SeatV1)
+	panel.SetOnlineV1(newConf.ApiConfig.OnlineV1)
+	panel.SetTrafficIdempotent(newConf.ApiConfig.TrafficIdempotent)
 	p := panel.NewClientV2(&newConf.ApiConfig)
 	serverconfig, err := panel.GetServerConfig(context.Background(), p)
 	if err != nil {

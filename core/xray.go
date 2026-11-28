@@ -29,6 +29,18 @@ type AddUsersParams struct {
 	Tag   string
 	Users []panel.UserInfo
 	*panel.NodeInfo
+	// Quiet 返回 true 的用户之前已经失败并告警过（内容未变）：这次再失败只记 Debug，不重复 Warn。可为 nil
+	Quiet func(panel.UserInfo) bool
+}
+
+// logSkip 单条用户被跳过：首次 Warn，已告警过的同一内容降为 Debug
+func (p *AddUsersParams) logSkip(u panel.UserInfo, key string, value any, msg string) {
+	entry := log.WithFields(log.Fields{"tag": p.Tag, "uid": u.Id, key: value})
+	if p.Quiet != nil && p.Quiet(u) {
+		entry.Debug(msg)
+		return
+	}
+	entry.Warn(msg)
 }
 
 type XrayCore struct {
