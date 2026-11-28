@@ -127,6 +127,7 @@ func (r *Reporter) Add(e *nodev1.LogEvent) {
 	if e.Count == 0 {
 		e.Count = 1
 	}
+	fixEvent(e)
 	key := MergeKey(e.Code, e.Protocol, int(e.Port), e.Message)
 
 	r.mu.Lock()
@@ -160,10 +161,28 @@ func (r *Reporter) Add(e *nodev1.LogEvent) {
 	}
 }
 
+// fixEvent 保证事件所有字符串字段为合法 UTF-8：一条坏数据不能让整批 proto/protojson 序列化失败。
+func fixEvent(e *nodev1.LogEvent) {
+	e.Level = validUTF8(e.Level)
+	e.Code = validUTF8(e.Code)
+	e.Stage = validUTF8(e.Stage)
+	e.Protocol = validUTF8(e.Protocol)
+	e.Message = validUTF8(e.Message)
+	e.Version = validUTF8(e.Version)
+	for i, l := range e.Context {
+		e.Context[i] = validUTF8(l)
+	}
+}
+
 // Resolve 记录一条恢复通知；同一 scope/protocol/port 只保留最新一条。
 func (r *Reporter) Resolve(res *nodev1.LogResolve) {
 	if res == nil {
 		return
+	}
+	res.Scope = validUTF8(res.Scope)
+	res.Protocol = validUTF8(res.Protocol)
+	for i, a := range res.ActiveInbounds {
+		res.ActiveInbounds[i] = validUTF8(a)
 	}
 	key := res.Scope + "|" + res.Protocol + "|" + strconv.FormatUint(uint64(res.Port), 10)
 	r.mu.Lock()

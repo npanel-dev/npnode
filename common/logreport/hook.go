@@ -79,9 +79,9 @@ func (h *Hook) Fire(entry *logrus.Entry) error {
 
 	ev := &nodev1.LogEvent{
 		Level:      level,
-		Code:       code,
-		Stage:      stage,
-		Protocol:   protocol,
+		Code:       validUTF8(code),
+		Stage:      validUTF8(stage),
+		Protocol:   validUTF8(protocol),
 		Port:       uint32(port),
 		Message:    Sanitize(msg),
 		Context:    h.ring.Last(contextLines),
