@@ -230,8 +230,33 @@ func TestGetLinkRevokedAfterAdmit(t *testing.T) {
 	}
 }
 
-// I4：admission_v1 下原本不限速的已有连接，原地改为限速后立即被限速，且连接未断开
-func TestExistingUnlimitedLinkLimitedAfterUpdate(t *testing.T) {
+func drain(r buf.Reader) {
+	for {
+		mb, err := r.ReadMultiBuffer()
+		buf.ReleaseMulti(mb)
+		if err != nil {
+			return
+		}
+	}
+}
+
+func writeN(t *testing.T, w buf.Writer, n int) (time.Duration, error) {
+	t.Helper()
+	start := time.Now()
+	for n > 0 {
+		b := buf.New()
+		sz := min(n, int(b.Cap()))
+		b.Extend(int32(sz))
+		if err := w.WriteMultiBuffer(buf.MultiBuffer{b}); err != nil {
+			return time.Since(start), err
+		}
+		n -= sz
+	}
+	return time.Since(start), nil
+}
+
+// I4（裁定调整）：admission_v1 下原本不限速的已有连接（没有限速写端、可走 splice），改为限速时被关闭，重连后按新限速
+func TestExistingUnlimitedLinkClosedWhenLimited(t *testing.T) {
 	l, _, _ := setupAdmissionLimiter(t, 0)
 	d := &DefaultDispatcher{}
 	in, out, _, err := d.getLink(onlineCtx(context.Background(), "203.0.113.7"), net.Network_TCP)
@@ -239,34 +264,35 @@ func TestExistingUnlimitedLinkLimitedAfterUpdate(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer common.Close(in.Writer)
-	go func() {
-		for {
-			mb, err := out.Reader.ReadMultiBuffer()
-			buf.ReleaseMulti(mb)
-			if err != nil {
-				return
-			}
-		}
-	}()
-	write := func(n int) time.Duration {
-		start := time.Now()
-		for n > 0 {
-			b := buf.New()
-			sz := min(n, int(b.Cap()))
-			b.Extend(int32(sz))
-			if err := in.Writer.WriteMultiBuffer(buf.MultiBuffer{b}); err != nil {
-				t.Fatal(err)
-			}
-			n -= sz
-		}
-		return time.Since(start)
+	go drain(out.Reader)
+	if linkCount(d) != 1 {
+		t.Fatal("link")
 	}
-	if d := write(64 << 10); d > 300*time.Millisecond {
-		t.Fatalf("unlimited write took %v", d)
+	l.UpdateUserLimit(format.UserTag(onlineTag, "u-45"), 160000, 1)
+	if linkCount(d) != 0 || l.Conns.Active() != 0 {
+		t.Fatalf("unlimited→limited must close existing link: links=%d active=%d", linkCount(d), l.Conns.Active())
 	}
-	l.UpdateUserLimit(format.UserTag(onlineTag, "u-45"), 160000, 1) // 20000 B/s
-	if d := write(40000); d < 700*time.Millisecond {
-		t.Fatalf("limited write took %v, want ≥ ~1s", d)
+	if _, err := writeN(t, in.Writer, 1024); err == nil {
+		t.Fatal("closed link must not accept writes")
+	}
+}
+
+// 限速 → 不限速：已有连接原地变为不限速、不断开
+func TestExistingLimitedLinkUnlimitedInPlace(t *testing.T) {
+	l, _, _ := setupAdmissionLimiter(t, 160000) // 20000 B/s
+	d := &DefaultDispatcher{}
+	in, out, _, err := d.getLink(onlineCtx(context.Background(), "203.0.113.7"), net.Network_TCP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer common.Close(in.Writer)
+	go drain(out.Reader)
+	if dur, err := writeN(t, in.Writer, 40000); err != nil || dur < 700*time.Millisecond {
+		t.Fatalf("limited write took %v err=%v", dur, err)
+	}
+	l.UpdateUserLimit(format.UserTag(onlineTag, "u-45"), 0, 1)
+	if dur, err := writeN(t, in.Writer, 256<<10); err != nil || dur > 300*time.Millisecond {
+		t.Fatalf("unlimited write took %v err=%v", dur, err)
 	}
 	if linkCount(d) != 1 {
 		t.Fatal("connection must stay open")

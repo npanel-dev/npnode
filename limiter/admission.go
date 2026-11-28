@@ -107,10 +107,15 @@ type Admission struct {
 type admEntry struct {
 	// links 本进程所有入站上这个 (uid, ip) 的活跃链路数
 	links int
-	// closers 链路登记时提供的关闭函数（按登记序号），保活被拒时逐条调用
-	closers map[uint64]func()
+	// closers 链路登记时提供的关闭函数（按登记序号），保活被拒、或用户由不限速改为限速时调用
+	closers map[uint64]linkCloser
 	// sess 准入会话；nil 表示没有（device_limit 为 0 的用户、被拒后等待链路关闭）
 	sess *admSession
+}
+
+type linkCloser struct {
+	taguuid string
+	fn      func()
 }
 
 type admSession struct {
@@ -498,6 +503,11 @@ func (a *Admission) panelOK() {
 // closeLink 可选：关闭这条链路的函数，保活被拒时调用（不依赖链路所在的 dispatcher，重载前的链路也能关掉）。
 // 已入队、尚未发出的 release 随之撤销（§7.6）。
 func (a *Admission) Open(uid int, ip string, closeLink func()) (release func()) {
+	return a.OpenLink(uid, ip, "", closeLink)
+}
+
+// OpenLink 同 Open，并记下链路所属的 taguuid（CloseUserLinks 按它挑选）
+func (a *Admission) OpenLink(uid int, ip, taguuid string, closeLink func()) (release func()) {
 	ip, ok := admNormalizeIP(ip)
 	if uid <= 0 || !ok {
 		return func() {}
@@ -509,9 +519,9 @@ func (a *Admission) Open(uid int, ip string, closeLink func()) (release func()) 
 	id := a.linkSeq
 	if closeLink != nil {
 		if e.closers == nil {
-			e.closers = make(map[uint64]func())
+			e.closers = make(map[uint64]linkCloser)
 		}
-		e.closers[id] = closeLink
+		e.closers[id] = linkCloser{taguuid: taguuid, fn: closeLink}
 	}
 	if e.sess != nil {
 		e.sess.releasing = false
@@ -561,6 +571,25 @@ func (a *Admission) pushLocked(it releaseItem) {
 	if e := a.entryLocked(dropped.uid, dropped.ip); e != nil && e.sess == dropped.sess && dropped.sess.releasing && e.links <= 0 {
 		a.dropSessionLocked(dropped.uid, dropped.ip, e)
 	}
+}
+
+// CloseUserLinks 关闭 uid 在 taguuid（某个入站上的这个用户）下登记过的全部链路，不动会话（U5：原不限速改为限速，
+// 这些链路没有限速写端，断开后客户端重连按新限速）。按链路登记的关闭函数执行，重载前旧 dispatcher 上的链路也能关掉
+func (a *Admission) CloseUserLinks(uid int, taguuid string) int {
+	a.mu.Lock()
+	var fns []func()
+	for _, e := range a.users[uid] {
+		for _, c := range e.closers {
+			if c.taguuid == taguuid {
+				fns = append(fns, c.fn)
+			}
+		}
+	}
+	a.mu.Unlock()
+	for _, fn := range fns {
+		fn()
+	}
+	return len(fns)
 }
 
 // Forget 用户的 device_limit 改为 0（U5，例如面板关闭了实时准入）：不再保活，已登记的会话立即 release；链路照常保留
@@ -777,7 +806,7 @@ func (a *Admission) applyResult(j checkJob, res *panel.SessionResult, err error)
 	s.releaseAfterCheck = false
 	closers := make([]func(), 0, len(e.closers))
 	for _, c := range e.closers {
-		closers = append(closers, c)
+		closers = append(closers, c.fn)
 	}
 	a.dropSessionLocked(j.uid, j.ip, e)
 	a.cacheDenyLocked(admKey{j.uid, j.ip}, a.now())

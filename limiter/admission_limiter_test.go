@@ -179,34 +179,59 @@ func TestUpdateUserLimitTogglesAdmission(t *testing.T) {
 	eventually(t, "adopt closes", func() bool { return len(cr.list()) == 1 })
 }
 
-// I4：挂了准入时不限速的连接也拿到间接层（里面为 nil 即不限速），之后原地改为限速对已有连接立即生效；
-// M5：只改设备数时不重建 bucket（不给已有连接额外的突发额度）
-func TestAdmissionUnlimitedGetsIndirection(t *testing.T) {
+// I4（裁定调整）：挂了准入时不限速的连接仍返回 nil（保留 splice）；原不限速 → 现限速时关闭该用户（该 taguuid）的现有链路，
+// 客户端重连后按新限速；其他用户、同一 uid 在其他入站的链路不受影响
+func TestAdmissionUnlimitedToLimitedClosesLinks(t *testing.T) {
 	withAdmissionV1(t, false)
 	panel.SetSeatV1(true)
 	t.Cleanup(func() { panel.SetSeatV1(false) })
-	const tag = "adm-i4"
-	l := AddInboundLimiter(tag, "vless", 443, []panel.UserInfo{{Id: 9, Uuid: "u"}}, nil)
-	t.Cleanup(func() { DeleteLimiter(tag) })
+	const tag, other = "adm-i4", "adm-i4-other"
+	l := AddInboundLimiter(tag, "vless", 443, []panel.UserInfo{{Id: 9, Uuid: "u"}, {Id: 10, Uuid: "v"}}, nil)
+	lo := AddInboundLimiter(other, "trojan", 8443, []panel.UserInfo{{Id: 9, Uuid: "u"}}, nil)
+	t.Cleanup(func() { DeleteLimiter(tag); DeleteLimiter(other) })
 	key := format.UserTag(tag, "u")
-	ref, _ := l.CheckLimit(key, "203.0.113.9", true, true)
-	if ref == nil || ref.Load() != nil {
-		t.Fatalf("ref = %v, want non-nil indirection holding nil", ref)
+	if ref, _ := l.CheckLimit(key, "203.0.113.9", true, true); ref != nil {
+		t.Fatalf("unlimited must return nil (keep splice), got %v", ref)
 	}
+	var closedU, closedV, closedOther int
+	var relU func()
+	relU = l.OpenConnWithCloser(key, "203.0.113.9", func() { closedU++; relU() })
+	defer l.OpenConnWithCloser(format.UserTag(tag, "v"), "203.0.113.9", func() { closedV++ })()
+	defer lo.OpenConnWithCloser(format.UserTag(other, "u"), "203.0.113.9", func() { closedOther++ })()
 	l.UpdateUserLimit(key, 524288, 0)
-	if ref.Capacity() != 65536 {
-		t.Fatalf("capacity = %d, want 65536", ref.Capacity())
+	if closedU != 1 || closedV != 0 || closedOther != 0 {
+		t.Fatalf("closed u=%d v=%d other-inbound=%d, want 1/0/0", closedU, closedV, closedOther)
 	}
+	ref, _ := l.CheckLimit(key, "203.0.113.9", true, true)
+	if ref == nil || ref.Capacity() != 65536 {
+		t.Fatalf("reconnect must get the new limit: %v", ref)
+	}
+	// M5：只改设备数不重建 bucket
 	b := ref.Load()
 	l.UpdateUserLimit(key, 524288, 1)
 	if ref.Load() != b {
 		t.Fatal("device-only change must keep the same bucket")
 	}
-	l.UpdateUserLimit(key, 0, 1)
-	if ref.Load() != nil {
-		t.Fatal("back to unlimited")
+}
+
+// 限速 → 不限速、限速 → 限速：原地生效，不关闭连接
+func TestAdmissionLimitedChangesInPlace(t *testing.T) {
+	withAdmissionV1(t, false)
+	panel.SetSeatV1(true)
+	t.Cleanup(func() { panel.SetSeatV1(false) })
+	const tag = "adm-i4b"
+	l := AddInboundLimiter(tag, "vless", 443, []panel.UserInfo{{Id: 9, Uuid: "u", SpeedLimit: 524288}}, nil)
+	t.Cleanup(func() { DeleteLimiter(tag) })
+	key := format.UserTag(tag, "u")
+	ref, _ := l.CheckLimit(key, "203.0.113.9", true, true)
+	closed := 0
+	defer l.OpenConnWithCloser(key, "203.0.113.9", func() { closed++ })()
+	l.UpdateUserLimit(key, 4194304, 0)
+	if ref.Capacity() != 524288 || closed != 0 {
+		t.Fatalf("limited→limited: capacity=%d closed=%d", ref.Capacity(), closed)
 	}
-	if again, _ := l.CheckLimit(key, "203.0.113.9", true, true); again != ref {
-		t.Fatal("same indirection for new connections")
+	l.UpdateUserLimit(key, 0, 0)
+	if ref.Load() != nil || closed != 0 {
+		t.Fatalf("limited→unlimited must be in place: bucket=%v closed=%d", ref.Load(), closed)
 	}
 }

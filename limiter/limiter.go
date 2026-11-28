@@ -11,6 +11,7 @@ import (
 	"github.com/npanel-dev/npnode/api/panel"
 	"github.com/npanel-dev/npnode/common/format"
 	"github.com/npanel-dev/npnode/common/rate"
+	log "github.com/sirupsen/logrus"
 )
 
 var limitLock sync.RWMutex
@@ -202,7 +203,8 @@ func (l *Limiter) UpdateUser(tag string, added []panel.UserInfo, deleted []panel
 }
 
 // UpdateUserLimit 原地更新用户的限速和设备数（U5）：替换 UserLimitInfo，并替换已有 bucket 间接层里的 bucket，
-// 已有连接下一次写入即按新速率；不删用户、不断连接。用户不在限速器里时什么都不做。
+// 已有连接下一次写入即按新速率；不删用户。唯一例外：挂了准入时原不限速 → 现限速，不限速的连接没有限速写端，
+// 关闭该用户（taguuid）的现有链路让其重连。用户不在限速器里时什么都不做。
 // 动态限速（DynamicSpeedLimit / ExpireTime）原样保留。
 func (l *Limiter) UpdateUserLimit(taguuid string, speedLimit, deviceLimit int) {
 	v, ok := l.UserLimitInfo.Load(taguuid)
@@ -226,15 +228,27 @@ func (l *Limiter) UpdateUserLimit(taguuid string, speedLimit, deviceLimit int) {
 	if speedLimit == oldSpeed {
 		return // 只改设备数：不重建 bucket，避免给已有连接一次额外的突发额度
 	}
-	ref, ok := l.SpeedLimiter.Load(taguuid)
-	if !ok {
-		return // 还没有连接建立过 bucket，下一次 CheckLimit 按新值建立
+	oldInfo := *v.(*UserLimitInfo)
+	newLimit := l.effectiveLimit(&nu)
+	if ref, ok := l.SpeedLimiter.Load(taguuid); ok {
+		ref.(*rate.Bucket).Store(newUserBucket(newLimit))
 	}
-	userLimit := nu.SpeedLimit
-	if nu.ExpireTime == 0 || nu.ExpireTime >= time.Now().Unix() {
-		userLimit = determineSpeedLimit(nu.SpeedLimit, nu.DynamicSpeedLimit)
+	// 原不限速 → 现限速：不限速的连接没有限速写端（保留 splice），无法原地生效；关闭它们，客户端重连后按新限速。
+	// 限速 → 限速、限速 → 不限速都已经通过间接层原地生效
+	if l.Admission != nil && l.effectiveLimit(&oldInfo) <= 0 && newLimit > 0 {
+		if n := l.Admission.CloseUserLinks(nu.UID, taguuid); n > 0 {
+			log.WithFields(log.Fields{"uid": nu.UID, "链路": n}).Info("用户由不限速改为限速，断开现有连接以按新限速重连")
+		}
 	}
-	ref.(*rate.Bucket).Store(newUserBucket(speedLimitBytesPerSecond(determineSpeedLimit(l.SpeedLimit, userLimit), l.BitPerSecond)))
+}
+
+// effectiveLimit 用户此刻生效的限速（字节每秒，0 为不限），口径与 CheckLimit 相同
+func (l *Limiter) effectiveLimit(u *UserLimitInfo) int64 {
+	userLimit := u.SpeedLimit
+	if u.ExpireTime == 0 || u.ExpireTime >= time.Now().Unix() {
+		userLimit = determineSpeedLimit(u.SpeedLimit, u.DynamicSpeedLimit)
+	}
+	return speedLimitBytesPerSecond(determineSpeedLimit(l.SpeedLimit, userLimit), l.BitPerSecond)
 }
 
 // newUserBucket 字节每秒为 limit 的 bucket；limit <= 0 表示不限速，返回 nil
@@ -321,11 +335,6 @@ func (l *Limiter) CheckLimit(taguuid string, ip string, isTcp bool, noSSUDP bool
 		}
 		v, _ := l.SpeedLimiter.LoadOrStore(taguuid, rate.NewBucket(newUserBucket(limit)))
 		return v.(*rate.Bucket), false
-	} else if l.Admission != nil {
-		// 挂了准入（U5 生效）：不限速的连接也挂间接层（里面为 nil 即不限速），之后原地改为限速对已有连接立即生效。
-		// 代价是这些连接不再走 splice；未挂准入时保持原样：不挂、零开销
-		v, _ := l.SpeedLimiter.LoadOrStore(taguuid, rate.NewBucket(nil))
-		return v.(*rate.Bucket), false
 	} else {
 		return nil, false
 	}
@@ -396,7 +405,7 @@ func (l *Limiter) OpenConnWithCloser(taguuid string, ip string, closeLink func()
 		return connRelease
 	}
 	// 准入与连接表共用这一个钩子：同一条链路在两张表里同时登记、同时释放
-	admRelease := l.Admission.Open(uid, ip, closeLink)
+	admRelease := l.Admission.OpenLink(uid, ip, taguuid, closeLink)
 	var once sync.Once
 	return func() {
 		once.Do(func() {
