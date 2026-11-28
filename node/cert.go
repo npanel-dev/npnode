@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/npanel-dev/npnode/common/file"
+	"github.com/npanel-dev/npnode/common/logreport"
 	nodev1 "github.com/npanel-dev/npnode/proto/node/v1"
 	log "github.com/sirupsen/logrus"
 )
@@ -105,6 +106,10 @@ func (c *Controller) reportCert(ok bool, errMsg string, notAfter time.Time) {
 	var na int64
 	if !notAfter.IsZero() {
 		na = notAfter.Unix()
+	}
+	if ok {
+		// 证书可用：通知面板该入站此前的证书类问题已恢复
+		logreport.Resolve(logreport.ScopeCert, c.info.Type, c.info.Protocol.Port, nil)
 	}
 	sendCertReport(c, &nodev1.CertReport{
 		Protocol:  c.info.Type,

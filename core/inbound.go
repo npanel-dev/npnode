@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/npanel-dev/npnode/api/panel"
+	"github.com/npanel-dev/npnode/common/logreport"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/inbound"
@@ -284,15 +285,18 @@ func vlessDecryption(p *panel.Protocol) (string, error) {
 		return "none", nil
 	case "mlkem768x25519plus":
 	default:
-		return "", fmt.Errorf("vless decryption method %s is not support", p.Encryption)
+		return "", logreport.Wrap(logreport.CodeVlessEncUnsupported, logreport.StageInbound,
+			fmt.Errorf("vless decryption method %s is not support", p.Encryption))
 	}
 	mode := strings.TrimSpace(p.EncryptionMode)
 	if mode == "" {
-		return "", fmt.Errorf("vless encryption mode is empty")
+		return "", logreport.Wrap(logreport.CodeVlessEncModeEmpty, logreport.StageInbound,
+			fmt.Errorf("vless encryption mode is empty"))
 	}
 	privateKey := strings.TrimSpace(p.EncryptionPrivateKey)
 	if privateKey == "" {
-		return "", fmt.Errorf("vless encryption private key is empty, generate a key pair in the panel")
+		return "", logreport.Wrap(logreport.CodeVlessEncKeyEmpty, logreport.StageInbound,
+			fmt.Errorf("vless encryption private key is empty, generate a key pair in the panel"))
 	}
 	ticket := "0"
 	if strings.TrimSpace(p.EncryptionRTT) == "0rtt" {

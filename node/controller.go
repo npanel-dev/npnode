@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/npanel-dev/npnode/api/panel"
+	"github.com/npanel-dev/npnode/common/logreport"
 	"github.com/npanel-dev/npnode/common/task"
 	vCore "github.com/npanel-dev/npnode/core"
 	"github.com/npanel-dev/npnode/limiter"
@@ -72,7 +73,7 @@ func (c *Controller) Start() error {
 	if !fetched {
 		c.userList, err = c.apiClient.GetUserList(context.Background())
 		if err != nil {
-			return fmt.Errorf("get user list error: %s", err)
+			return logreport.Wrap(logreport.CodeUserList, logreport.StageInbound, fmt.Errorf("get user list error: %w", err))
 		}
 	}
 	if len(c.userList) == 0 {
@@ -105,7 +106,7 @@ func (c *Controller) Start() error {
 	// Add new tag
 	err = c.server.AddNode(c.tag, c.info)
 	if err != nil {
-		return fmt.Errorf("add new node error: %s", err)
+		return fmt.Errorf("add new node error: %w", err)
 	}
 	added, err := c.server.AddUsers(&vCore.AddUsersParams{
 		Tag:      c.tag,
@@ -123,6 +124,8 @@ func (c *Controller) Start() error {
 	log.WithField("节点", c.tag).Infof("已添加 %d 个新用户", len(added))
 	c.startTasks(c.info)
 	c.started = true
+	// 入站启动成功：通知面板该入站此前的启动类问题已恢复
+	logreport.Resolve(logreport.ScopeInbound, c.info.Type, c.info.Protocol.Port, nil)
 	return nil
 }
 
