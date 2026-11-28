@@ -220,8 +220,9 @@ func TestGetLinkRevokedAfterAdmit(t *testing.T) {
 		t.Fatal("must be revoked without session")
 	}
 	d := &DefaultDispatcher{}
-	revokeNext = func() { a.Forget(1000000045) }
-	t.Cleanup(func() { revokeNext = nil })
+	hook := func() { a.Forget(1000000045) }
+	revokeNext.Store(&hook)
+	t.Cleanup(func() { revokeNext.Store(nil) })
 	if _, _, _, err := d.getLink(onlineCtx(context.Background(), "203.0.113.8"), net.Network_TCP); err == nil {
 		t.Fatal("revoked link must fail")
 	}

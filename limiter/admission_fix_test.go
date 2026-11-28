@@ -286,3 +286,69 @@ func TestDeniedClosesRegisteredLinks(t *testing.T) {
 	}
 	eventually(t, "entry gone", func() bool { return a.Stats().Entries == 1 })
 }
+
+// N1：同 /64 的两个会话先后归零：两者都在宽限期时，先到期的那个不发 release（兄弟仍在宽限，可能被复用）；
+// 都到期 → 恰好一次 release，组内会话全部清理
+func TestSlash64SiblingsInGraceReleaseOnce(t *testing.T) {
+	a, fc, _ := newTestAdmission(t)
+	a.KeepaliveMin, a.KeepaliveMax = time.Hour, time.Hour
+	a.ReleaseGrace = 40 * time.Millisecond
+	a.Admit(1, "2001:db8:1:2::a", 1, "vless", 443)
+	a.Admit(1, "2001:db8:1:2::b", 1, "vless", 443)
+	ra := a.Open(1, "2001:db8:1:2::a", nil)
+	rb := a.Open(1, "2001:db8:1:2::b", nil)
+	a.Start()
+	ra()
+	time.Sleep(10 * time.Millisecond)
+	rb()
+	eventually(t, "group cleaned", func() bool { return a.Stats() == AdmissionStats{} })
+	time.Sleep(60 * time.Millisecond)
+	if _, r := fc.counts(); r != 1 {
+		t.Fatalf("releases = %d, want exactly 1", r)
+	}
+}
+
+// N1：宽限内其中一个被复用 → 另一个到期也不发 release（成员仍在用）
+func TestSlash64SiblingReusedInGraceNoRelease(t *testing.T) {
+	a, fc, _ := newTestAdmission(t)
+	a.KeepaliveMin, a.KeepaliveMax = time.Hour, time.Hour
+	a.ReleaseGrace = 60 * time.Millisecond
+	a.Admit(1, "2001:db8:1:2::a", 1, "vless", 443)
+	a.Admit(1, "2001:db8:1:2::b", 1, "vless", 443)
+	ra := a.Open(1, "2001:db8:1:2::a", nil)
+	rb := a.Open(1, "2001:db8:1:2::b", nil)
+	a.Start()
+	rb()
+	time.Sleep(10 * time.Millisecond)
+	ra()
+	time.Sleep(10 * time.Millisecond)
+	a.Admit(1, "2001:db8:1:2::a", 1, "vless", 443) // 宽限内复用 a
+	defer a.Open(1, "2001:db8:1:2::a", nil)()
+	time.Sleep(150 * time.Millisecond)
+	if c, r := fc.counts(); r != 0 || c != 2 {
+		t.Fatalf("checks=%d releases=%d, want 2/0", c, r)
+	}
+	if !a.HasSession(1, "2001:db8:1:2::a") || a.HasSession(1, "2001:db8:1:2::b") {
+		t.Fatal("a reused, b cleaned locally")
+	}
+}
+
+// M1 分支：release 等保活期间保活被拒 → 不发 release（面板已无成员），会话与条目都清理
+func TestDeniedInflightKeepaliveSkipsRelease(t *testing.T) {
+	a, fc, _ := newTestAdmission(t)
+	bc := &blockingCheck{fakeChecker: fc, entered: make(chan struct{}), unblock: make(chan struct{})}
+	a.Configure(AdmissionConfig{Checker: bc, ServerID: 12})
+	a.Admit(1, "203.0.113.1", 1, "vless", 443)
+	rel := a.Open(1, "203.0.113.1", nil)
+	a.Start()
+	<-bc.entered
+	rel()
+	time.Sleep(40 * time.Millisecond) // 宽限到期，release 等保活
+	fc.set(deny("device_limit"))
+	close(bc.unblock)
+	eventually(t, "cleaned", func() bool { return a.Stats() == AdmissionStats{} })
+	time.Sleep(40 * time.Millisecond)
+	if _, r := fc.counts(); r != 0 {
+		t.Fatalf("releases = %d, want 0 after keepalive denial", r)
+	}
+}

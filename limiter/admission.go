@@ -320,11 +320,12 @@ func (a *Admission) otherActiveGroupsLocked(uid int, ip string) int {
 	return len(groups)
 }
 
-// groupBusyLocked 同一 uid 同一归并组内还有除 except 之外的有效会话（含同一 IP 上新建的会话）：面板成员仍在使用，不能 release
+// groupBusyLocked 同一 uid 同一归并组内还有除 except 之外的会话（含同一 IP 上新建的会话，以及仍在宽限期、可能被复用的兄弟会话）：
+// 面板成员仍可能在用，不能 release。组内最后一个到期的会话 claim 时兄弟都已移出表，由它发出唯一一次 release（N1）
 func (a *Admission) groupBusyLocked(uid int, ip string, except *admSession) bool {
 	g := admGroup(ip)
 	for other, e := range a.users[uid] {
-		if e.sess != nil && e.sess != except && !e.sess.releasing && admGroup(other) == g {
+		if e.sess != nil && e.sess != except && admGroup(other) == g {
 			return true
 		}
 	}

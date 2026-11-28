@@ -7,6 +7,7 @@ import (
 	"github.com/npanel-dev/npnode/common/format"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/npanel-dev/npnode/common/counter"
@@ -170,14 +171,14 @@ func trackOnlineLink(ctx context.Context, limit *limiter.Limiter, email, ip stri
 	}
 }
 
-// revokeNext 仅供测试：在链路登记之后、撤销检查之前执行，模拟这段窗口里会话被移除
-var revokeNext func()
+// revokeNext 仅供测试：在链路登记之后、撤销检查之前执行，模拟这段窗口里会话被移除。原子变量，测试并行或后台 goroutine 读取时无数据竞争
+var revokeNext atomic.Pointer[func()]
 
 // linkRevoked 链路加入管理器之后检查（M4）：Admit 放行后、加入前该 (uid, ip) 已被准入拒绝并关闭过，
 // 这条链路没被关到，调用方要立即关闭它
 func linkRevoked(limit *limiter.Limiter, email, ip string) bool {
-	if revokeNext != nil {
-		revokeNext()
+	if hook := revokeNext.Load(); hook != nil {
+		(*hook)()
 	}
 	return limit.Revoked(email, ip)
 }
