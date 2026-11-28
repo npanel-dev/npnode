@@ -20,6 +20,8 @@ func withAdmissionV1(t *testing.T, online bool) (*Admission, *fakeChecker, *clos
 	cr := &closeRecorder{}
 	a := EnsureAdmission(AdmissionConfig{Checker: fc, ServerID: 12, Closer: cr.close})
 	a.ReleaseBackoff = []time.Duration{time.Millisecond}
+	a.ReleaseGrace = 10 * time.Millisecond
+	a.DenyCacheTTL = 0
 	t.Cleanup(func() {
 		DisableAdmission()
 		panel.SetAdmissionV1(false)
@@ -175,4 +177,36 @@ func TestUpdateUserLimitTogglesAdmission(t *testing.T) {
 	fc.set(deny("device_limit"))
 	l.UpdateUserLimit(key, 0, 1)
 	eventually(t, "adopt closes", func() bool { return len(cr.list()) == 1 })
+}
+
+// I4：挂了准入时不限速的连接也拿到间接层（里面为 nil 即不限速），之后原地改为限速对已有连接立即生效；
+// M5：只改设备数时不重建 bucket（不给已有连接额外的突发额度）
+func TestAdmissionUnlimitedGetsIndirection(t *testing.T) {
+	withAdmissionV1(t, false)
+	panel.SetSeatV1(true)
+	t.Cleanup(func() { panel.SetSeatV1(false) })
+	const tag = "adm-i4"
+	l := AddInboundLimiter(tag, "vless", 443, []panel.UserInfo{{Id: 9, Uuid: "u"}}, nil)
+	t.Cleanup(func() { DeleteLimiter(tag) })
+	key := format.UserTag(tag, "u")
+	ref, _ := l.CheckLimit(key, "203.0.113.9", true, true)
+	if ref == nil || ref.Load() != nil {
+		t.Fatalf("ref = %v, want non-nil indirection holding nil", ref)
+	}
+	l.UpdateUserLimit(key, 524288, 0)
+	if ref.Capacity() != 65536 {
+		t.Fatalf("capacity = %d, want 65536", ref.Capacity())
+	}
+	b := ref.Load()
+	l.UpdateUserLimit(key, 524288, 1)
+	if ref.Load() != b {
+		t.Fatal("device-only change must keep the same bucket")
+	}
+	l.UpdateUserLimit(key, 0, 1)
+	if ref.Load() != nil {
+		t.Fatal("back to unlimited")
+	}
+	if again, _ := l.CheckLimit(key, "203.0.113.9", true, true); again != ref {
+		t.Fatal("same indirection for new connections")
+	}
 }

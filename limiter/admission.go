@@ -22,7 +22,11 @@ import (
 // 所以同一 (uid, ip) 在本进程只做一次 check、一路保活，只有跨所有入站的最后一条连接关闭时才 release。
 // 链路计数与 ConnTable 用同一个开、关钩子（Limiter.OpenConn 返回的释放函数）。
 //
-// 只对 device_limit > 0 的条目准入。会话表、释放队列、并发检查数都有上限；后台循环随 Start / Stop 启停。
+// 面板把名额的 IPv6 成员归一到 /64（devseat.NormalizeIP），check 响应里不返回归一后的成员，所以节点对 IPv6 按 /64 归并：
+// 同一 uid 同一 /64 内仍有活跃会话时不发 release（否则会删掉兄弟地址仍在用的成员）。IPv4 按完整 IP；
+// 面板 seat_conflict_ipv4_prefix 配成 <32 时节点无从得知，存在同样的残余风险。
+//
+// 只对 device_limit > 0 的条目准入。会话表、释放队列、拒绝缓存、并发检查数都有上限；后台循环随 Start / Stop 启停。
 
 // SessionChecker 面板准入接口（panel.SessionClient 实现）
 type SessionChecker interface {
@@ -35,7 +39,8 @@ type AdmissionConfig struct {
 	Checker SessionChecker
 	// ServerID 本服务器 ID，用于生成 connection_id
 	ServerID int64
-	// Closer 关闭本进程所有入站上 (uid, ip) 的全部连接（A2、A6）
+	// Closer 可选：保活被拒时额外调用（关闭当前内核上该 (uid, ip) 的连接）。
+	// 链路登记时提供的关闭函数总会被调用，重载前建立、仍在旧 dispatcher 上的链路也靠它关闭
 	Closer func(uid int, ip string)
 }
 
@@ -44,7 +49,21 @@ const (
 	DefaultAdmissionMaxSessions = 1 << 18
 	// DefaultReleaseQueueSize 释放队列上限：满了丢弃最旧的（§7.6）
 	DefaultReleaseQueueSize = 4096
+	// DefaultDenyCacheSize 拒绝负缓存上限：满了不再缓存
+	DefaultDenyCacheSize = 1 << 16
+	// internalUserIDBase 内部账号（中转、测试端）的起点，与面板 noderelay.RelayUserIDBase 相同；面板对它们直接放行
+	internalUserIDBase int64 = 9_000_000_000_000
 )
+
+// isInternalUser 内部账号：面板对 check 直接放行（compat_session.go IsInternalUserID），节点跳过准入
+func isInternalUser(uid int) bool {
+	return int64(uid) >= internalUserIDBase
+}
+
+type admKey struct {
+	uid int
+	ip  string
+}
 
 // Admission 进程级准入会话表
 type Admission struct {
@@ -53,9 +72,12 @@ type Admission struct {
 	users    map[int]map[string]*admEntry
 	sessions int
 	degraded int
-	sf       singleflight.Group
-	queue    *releaseQueue
-	recover  chan struct{}
+	linkSeq  uint64
+	// denied 面板拒绝（allowed=false）的负缓存，到期时间
+	denied  map[admKey]time.Time
+	sf      singleflight.Group
+	queue   *releaseQueue
+	recover chan struct{}
 
 	runMu   sync.Mutex
 	running bool
@@ -72,7 +94,10 @@ type Admission struct {
 	ScanInterval     time.Duration   // 保活扫描周期
 	ProbeInterval    time.Duration   // 降级期间用一个 degraded 会话试探面板的周期
 	OrphanAfter      time.Duration   // 放行后迟迟没有链路登记的会话，超过这么久按已关闭处理
+	ReleaseGrace     time.Duration   // 链路归零后等这么久再发 release，期间有新连接即撤销（§7.6）
 	ReleaseBackoff   []time.Duration // release 失败后的重试退避（重试次数 = 长度）
+	StaleReleasing   time.Duration   // 等待释放超过这么久仍未处理的会话直接移出（兜底，面板 120 秒 TTL 过期）
+	DenyCacheTTL     time.Duration   // 面板拒绝结果的负缓存时长，0 表示不缓存
 	CheckConcurrency int             // 后台保活 / 补发的并发请求数
 	ReleaseWorkers   int
 	MaxSessions      int
@@ -82,6 +107,8 @@ type Admission struct {
 type admEntry struct {
 	// links 本进程所有入站上这个 (uid, ip) 的活跃链路数
 	links int
+	// closers 链路登记时提供的关闭函数（按登记序号），保活被拒时逐条调用
+	closers map[uint64]func()
 	// sess 准入会话；nil 表示没有（device_limit 为 0 的用户、被拒后等待链路关闭）
 	sess *admSession
 }
@@ -97,9 +124,12 @@ type admSession struct {
 	// touched 最近一次放行时间：放行后一直没有链路登记的会话靠它判断为孤儿
 	touched time.Time
 	// releasing 链路已归零、release 已入队；在发出前又有新连接时清掉，即撤销这次 release
-	releasing bool
+	releasing      bool
+	releasingSince time.Time
 	// checking 后台保活 / 补发进行中，避免同一会话并发检查
 	checking bool
+	// releaseAfterCheck release 到期时保活还在途：等保活结果回来后再发（M1）
+	releaseAfterCheck bool
 }
 
 // NewAdmission 建立准入会话表（后台循环未启动，见 Start）
@@ -107,6 +137,7 @@ func NewAdmission(cfg AdmissionConfig) *Admission {
 	return &Admission{
 		cfg:              cfg,
 		users:            make(map[int]map[string]*admEntry),
+		denied:           make(map[admKey]time.Time),
 		queue:            newReleaseQueue(DefaultReleaseQueueSize),
 		recover:          make(chan struct{}, 1),
 		lastLog:          make(map[string]time.Time),
@@ -116,7 +147,10 @@ func NewAdmission(cfg AdmissionConfig) *Admission {
 		ScanInterval:     time.Second,
 		ProbeInterval:    10 * time.Second,
 		OrphanAfter:      30 * time.Second,
+		ReleaseGrace:     3 * time.Second,
 		ReleaseBackoff:   []time.Duration{time.Second, 2 * time.Second, 4 * time.Second},
+		StaleReleasing:   2 * time.Minute,
+		DenyCacheTTL:     5 * time.Second,
 		CheckConcurrency: 64,
 		ReleaseWorkers:   4,
 		MaxSessions:      DefaultAdmissionMaxSessions,
@@ -170,6 +204,23 @@ func (a *Admission) Stop() {
 func admNormalizeIP(ip string) (string, bool) {
 	ip = strings.TrimPrefix(ip, "::ffff:")
 	return ip, net.ParseIP(ip) != nil
+}
+
+// admGroup 面板名额成员的归并口径：IPv4 按完整地址，IPv6 按 /64
+func admGroup(ip string) string {
+	p := net.ParseIP(ip)
+	if p == nil || p.To4() != nil {
+		return ip
+	}
+	return p.Mask(net.CIDRMask(64, 128)).String() + "/64"
+}
+
+// managed 是否受准入管理：device_limit > 0、uid 有效且不是内部账号、IP 可解析
+func managed(uid int, ip string, deviceLimit int) (string, bool) {
+	if uid <= 0 || deviceLimit <= 0 || isInternalUser(uid) {
+		return "", false
+	}
+	return admNormalizeIP(ip)
 }
 
 func (a *Admission) entryLocked(uid int, ip string) *admEntry {
@@ -249,35 +300,69 @@ func (a *Admission) connID(ip string, now time.Time) string {
 	return strconv.FormatInt(a.cfg.ServerID, 10) + ":" + ip + ":" + strconv.FormatInt(now.UnixMilli(), 10)
 }
 
-// otherActiveIPsLocked 这个 uid 在本进程所有入站上除 ip 之外的活跃 IP 数（降级计数，§7.5）
-func (a *Admission) otherActiveIPsLocked(uid int, ip string) int {
-	n := 0
+// otherActiveGroupsLocked 这个 uid 在本进程所有入站上、与 ip 不同归并组的活跃设备数（降级计数，§7.5；IPv6 同一 /64 算一台）
+func (a *Admission) otherActiveGroupsLocked(uid int, ip string) int {
+	mine := admGroup(ip)
+	groups := make(map[string]struct{})
 	for other, e := range a.users[uid] {
-		if other == ip {
+		if !(e.links > 0 || (e.sess != nil && !e.sess.releasing)) {
 			continue
 		}
-		if e.links > 0 || (e.sess != nil && !e.sess.releasing) {
-			n++
+		if g := admGroup(other); g != mine {
+			groups[g] = struct{}{}
 		}
 	}
-	return n
+	return len(groups)
+}
+
+// groupBusyLocked 同一 uid 同一归并组内还有除 except 之外的有效会话（含同一 IP 上新建的会话）：面板成员仍在使用，不能 release
+func (a *Admission) groupBusyLocked(uid int, ip string, except *admSession) bool {
+	g := admGroup(ip)
+	for other, e := range a.users[uid] {
+		if e.sess != nil && e.sess != except && !e.sess.releasing && admGroup(other) == g {
+			return true
+		}
+	}
+	return false
+}
+
+// deniedLocked 是否在拒绝负缓存期内
+func (a *Admission) deniedLocked(k admKey, now time.Time) bool {
+	until, ok := a.denied[k]
+	if !ok {
+		return false
+	}
+	if now.Before(until) {
+		return true
+	}
+	delete(a.denied, k)
+	return false
+}
+
+// cacheDenyLocked 记下面板的拒绝结果（只缓存 allowed=false，不缓存降级 / 出错）
+func (a *Admission) cacheDenyLocked(k admKey, now time.Time) {
+	if a.DenyCacheTTL <= 0 {
+		return
+	}
+	if _, ok := a.denied[k]; !ok && len(a.denied) >= DefaultDenyCacheSize {
+		return
+	}
+	a.denied[k] = now.Add(a.DenyCacheTTL)
 }
 
 // Admit 判定 (uid, ip) 的一条新连接是否放行（A1、A5）。在 dispatch 的同步路径上，首连接最多阻塞约 Timeout。
-//   - deviceLimit <= 0、uid 无效、IP 无法解析：不准入，直接放行；
+//   - deviceLimit <= 0、uid 无效、内部账号、IP 无法解析：不准入，直接放行；
 //   - 这个 (uid, ip) 已有会话：复用，不再 check（含撤销已入队的 release）；
-//   - 否则 check（同一 (uid, ip) 并发的首连接用 singleflight 合并成一次）：放行则建会话；拒绝则不建，下次新连接重新 check；
-//     面板不可用时降级：本机该 uid 的其他活跃 IP 数已达 deviceLimit 则拒绝，否则放行并标记 degraded。
+//   - 面板几秒内刚拒绝过：直接拒绝（负缓存）；
+//   - 否则 check（同一 (uid, ip) 并发的首连接用 singleflight 合并成一次）：放行则建会话；拒绝则不建；
+//     面板不可用时降级：本机该 uid 其他活跃设备（IPv6 按 /64）已达 deviceLimit 则拒绝，否则放行并标记 degraded。
 func (a *Admission) Admit(uid int, ip string, deviceLimit int, protocol string, port int) bool {
-	if uid <= 0 || deviceLimit <= 0 {
-		return true
-	}
-	ip, ok := admNormalizeIP(ip)
+	ip, ok := managed(uid, ip, deviceLimit)
 	if !ok {
 		return true
 	}
-	if a.reuse(uid, ip) {
-		return true
+	if allowed, decided := a.fastPath(uid, ip); decided {
+		return allowed
 	}
 	v, _, _ := a.sf.Do(strconv.Itoa(uid)+"|"+ip, func() (interface{}, error) {
 		return a.firstCheck(uid, ip, deviceLimit, protocol, port), nil
@@ -285,22 +370,24 @@ func (a *Admission) Admit(uid int, ip string, deviceLimit int, protocol string, 
 	return v.(bool)
 }
 
-// reuse 已有会话时复用：刷新放行时间，撤销尚未发出的 release
-func (a *Admission) reuse(uid int, ip string) bool {
+// fastPath 已有会话时复用（刷新放行时间，撤销尚未发出的 release）；在拒绝负缓存期内直接拒绝
+func (a *Admission) fastPath(uid int, ip string) (allowed, decided bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	e := a.entryLocked(uid, ip)
-	if e == nil || e.sess == nil {
-		return false
+	if e := a.entryLocked(uid, ip); e != nil && e.sess != nil {
+		e.sess.releasing = false
+		e.sess.touched = a.now()
+		return true, true
 	}
-	e.sess.releasing = false
-	e.sess.touched = a.now()
-	return true
+	if a.deniedLocked(admKey{uid, ip}, a.now()) {
+		return false, true
+	}
+	return false, false
 }
 
 func (a *Admission) firstCheck(uid int, ip string, deviceLimit int, protocol string, port int) bool {
-	if a.reuse(uid, ip) {
-		return true // singleflight 上一轮刚建好会话
+	if allowed, decided := a.fastPath(uid, ip); decided {
+		return allowed // singleflight 上一轮刚有结果
 	}
 	a.mu.Lock()
 	if a.sessions >= a.MaxSessions {
@@ -322,7 +409,7 @@ func (a *Admission) firstCheck(uid int, ip string, deviceLimit int, protocol str
 		return true
 	}
 	if err != nil {
-		if a.otherActiveIPsLocked(uid, ip) >= deviceLimit {
+		if a.otherActiveGroupsLocked(uid, ip) >= deviceLimit {
 			log.WithFields(log.Fields{"uid": uid, "ip": ip, "device_limit": deviceLimit}).Info("面板准入不可用，本机降级：该用户其他 IP 已达设备数，拒绝")
 			return false
 		}
@@ -333,12 +420,26 @@ func (a *Admission) firstCheck(uid int, ip string, deviceLimit int, protocol str
 	}
 	a.panelOKLocked()
 	if !res.Allowed {
+		a.cacheDenyLocked(admKey{uid, ip}, a.now())
 		log.WithFields(log.Fields{"uid": uid, "ip": ip, "reason": res.Reason, "current": res.Current, "limit": res.Limit}).Info("准入被拒，关闭连接")
 		return false
 	}
 	s := a.newSessionLocked(uid, ip, protocol, port, false, now)
 	s.connID = connID
 	return true
+}
+
+// Revoked 链路登记（Open）之后调用：这条受准入管理的链路所属 (uid, ip) 已经没有会话（Admit 放行后、登记前保活被拒并关闭了连接），
+// 调用方应立即关闭它（M4）。不受准入管理的链路（与 Admit 的跳过条件相同）永远返回 false
+func (a *Admission) Revoked(uid int, ip string, deviceLimit int) bool {
+	ip, ok := managed(uid, ip, deviceLimit)
+	if !ok {
+		return false
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	e := a.entryLocked(uid, ip)
+	return e == nil || e.sess == nil
 }
 
 // check 发一次 check；失败（面板不可用）时限频记日志：400 / 403 记 Error，其余记 Warn
@@ -394,8 +495,9 @@ func (a *Admission) panelOK() {
 }
 
 // Open 登记 (uid, ip) 的一条链路，返回释放函数（可重复、并发调用，只生效一次）。
+// closeLink 可选：关闭这条链路的函数，保活被拒时调用（不依赖链路所在的 dispatcher，重载前的链路也能关掉）。
 // 已入队、尚未发出的 release 随之撤销（§7.6）。
-func (a *Admission) Open(uid int, ip string) (release func()) {
+func (a *Admission) Open(uid int, ip string, closeLink func()) (release func()) {
 	ip, ok := admNormalizeIP(ip)
 	if uid <= 0 || !ok {
 		return func() {}
@@ -403,22 +505,31 @@ func (a *Admission) Open(uid int, ip string) (release func()) {
 	a.mu.Lock()
 	e := a.ensureEntryLocked(uid, ip)
 	e.links++
+	a.linkSeq++
+	id := a.linkSeq
+	if closeLink != nil {
+		if e.closers == nil {
+			e.closers = make(map[uint64]func())
+		}
+		e.closers[id] = closeLink
+	}
 	if e.sess != nil {
 		e.sess.releasing = false
 	}
 	a.mu.Unlock()
 	var once sync.Once
-	return func() { once.Do(func() { a.close(uid, ip) }) }
+	return func() { once.Do(func() { a.close(uid, ip, id) }) }
 }
 
-// close 链路关闭：跨所有入站的最后一条关闭时，有会话就把 release 放进释放队列（A4、A7），没有就删除条目
-func (a *Admission) close(uid int, ip string) {
+// close 链路关闭：跨所有入站的最后一条关闭时，有会话就（宽限后）release（A4、A7），没有就删除条目
+func (a *Admission) close(uid int, ip string, id uint64) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	e := a.entryLocked(uid, ip)
 	if e == nil || e.links <= 0 {
 		return
 	}
+	delete(e.closers, id)
 	e.links--
 	if e.links > 0 {
 		return
@@ -427,13 +538,28 @@ func (a *Admission) close(uid int, ip string) {
 		a.deleteEntryLocked(uid, ip)
 		return
 	}
-	a.enqueueReleaseLocked(uid, ip, e.sess)
+	a.enqueueReleaseLocked(uid, ip, e.sess, a.ReleaseGrace)
 }
 
-func (a *Admission) enqueueReleaseLocked(uid int, ip string, s *admSession) {
+func (a *Admission) enqueueReleaseLocked(uid int, ip string, s *admSession, delay time.Duration) {
+	now := a.now()
 	s.releasing = true
-	if dropped := a.queue.push(releaseItem{uid: uid, ip: ip, sess: s}); dropped {
-		a.logLimited("queue-full", log.WarnLevel, "准入释放队列已满，丢弃最旧的 release（面板 120 秒后自然过期）", log.Fields{"上限": a.queue.cap})
+	s.releasingSince = now
+	a.pushLocked(releaseItem{uid: uid, ip: ip, sess: s, notBefore: now.Add(delay)})
+}
+
+// pushLocked 入队；队列满时丢弃最旧的条目，并把它对应的会话移出会话表（I1：不留下永远等待释放的会话）
+func (a *Admission) pushLocked(it releaseItem) {
+	dropped, ok := a.queue.push(it)
+	if !ok {
+		return
+	}
+	a.logLimited("queue-full", log.WarnLevel, "准入释放队列已满，丢弃最旧的 release（面板 120 秒后自然过期）", log.Fields{"上限": a.queue.cap})
+	if dropped.forced {
+		return // 会话已不在表里
+	}
+	if e := a.entryLocked(dropped.uid, dropped.ip); e != nil && e.sess == dropped.sess && dropped.sess.releasing && e.links <= 0 {
+		a.dropSessionLocked(dropped.uid, dropped.ip, e)
 	}
 }
 
@@ -447,15 +573,16 @@ func (a *Admission) Forget(uid int) {
 			continue
 		}
 		a.dropSessionLocked(uid, ip, e)
-		if dropped := a.queue.push(releaseItem{uid: uid, ip: ip, sess: s, forced: true}); dropped {
-			a.logLimited("queue-full", log.WarnLevel, "准入释放队列已满，丢弃最旧的 release（面板 120 秒后自然过期）", log.Fields{"上限": a.queue.cap})
-		}
+		a.pushLocked(releaseItem{uid: uid, ip: ip, sess: s, forced: true})
 	}
 }
 
 // Adopt 用户的 device_limit 由 0 改为正数（U5）：给仍有活跃链路、但还没有会话的 (uid, ip) 建会话并立即 check，
 // 被拒的关闭对应连接
 func (a *Admission) Adopt(uid int, protocol string, port int) {
+	if isInternalUser(uid) {
+		return
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	now := a.now()
@@ -504,20 +631,32 @@ func jobFor(uid int, ip string, s *admSession) checkJob {
 	}}
 }
 
-// collectKeepalive 到期的会话（A3）；顺带把放行后迟迟没有链路登记的孤儿会话按已关闭处理
+// collectKeepalive 到期的会话（A3）；顺带处理孤儿会话、长期等待释放的会话，清理过期的拒绝缓存
 func (a *Admission) collectKeepalive() []checkJob {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	now := a.now()
+	for k, until := range a.denied {
+		if !now.Before(until) {
+			delete(a.denied, k)
+		}
+	}
 	var jobs []checkJob
 	for uid, m := range a.users {
 		for ip, e := range m {
 			s := e.sess
-			if s == nil || s.releasing || s.checking {
+			if s == nil || s.checking {
+				continue
+			}
+			if s.releasing {
+				if e.links <= 0 && now.Sub(s.releasingSince) >= a.StaleReleasing {
+					a.logLimited("stale-release", log.WarnLevel, "准入会话等待释放过久，直接移出（面板 120 秒后自然过期）", log.Fields{"uid": uid})
+					a.dropSessionLocked(uid, ip, e)
+				}
 				continue
 			}
 			if e.links <= 0 && now.Sub(s.touched) >= a.OrphanAfter {
-				a.enqueueReleaseLocked(uid, ip, s)
+				a.enqueueReleaseLocked(uid, ip, s, 0)
 				continue
 			}
 			if now.Before(s.next) {
@@ -583,17 +722,33 @@ func (a *Admission) runChecks(ctx context.Context, jobs []checkJob) {
 
 func (a *Admission) abandon(j checkJob) {
 	a.mu.Lock()
+	defer a.mu.Unlock()
+	if e := a.entryLocked(j.uid, j.ip); e != nil && e.sess == j.sess {
+		a.finishCheckLocked(j.uid, j.ip, e, j.sess)
+		return
+	}
 	j.sess.checking = false
-	a.mu.Unlock()
+}
+
+// finishCheckLocked 一次后台检查结束；期间 release 已到期（M1）就现在发
+func (a *Admission) finishCheckLocked(uid int, ip string, e *admEntry, s *admSession) {
+	s.checking = false
+	if !s.releaseAfterCheck {
+		return
+	}
+	s.releaseAfterCheck = false
+	if s.releasing && e.links <= 0 {
+		a.pushLocked(releaseItem{uid: uid, ip: ip, sess: s, notBefore: a.now()})
+	}
 }
 
 // applyResult 保活 / 补发的结果：放行清除 degraded；失败标记 degraded、不关闭连接；
-// 拒绝时删除会话并关闭这个 (uid, ip) 跨所有入站的全部连接（A2、A6），之后同一 (uid, ip) 的新连接重新 check
+// 拒绝时删除会话并关闭这个 (uid, ip) 跨所有入站的全部连接（A2、A6），短暂负缓存后同一 (uid, ip) 的新连接重新 check
 func (a *Admission) applyResult(j checkJob, res *panel.SessionResult, err error) {
 	a.mu.Lock()
-	j.sess.checking = false
 	e := a.entryLocked(j.uid, j.ip)
 	if e == nil || e.sess != j.sess {
+		j.sess.checking = false
 		a.mu.Unlock()
 		return // 会话已经不在了（释放、被拒、Forget）
 	}
@@ -603,6 +758,7 @@ func (a *Admission) applyResult(j checkJob, res *panel.SessionResult, err error)
 			s.degraded = true
 			a.degraded++
 		}
+		a.finishCheckLocked(j.uid, j.ip, e, s)
 		a.mu.Unlock()
 		return
 	}
@@ -611,15 +767,27 @@ func (a *Admission) applyResult(j checkJob, res *panel.SessionResult, err error)
 			s.degraded = false
 			a.degraded--
 		}
+		a.finishCheckLocked(j.uid, j.ip, e, s)
 		a.panelOKLocked()
 		a.mu.Unlock()
 		return
 	}
+	// 被拒：面板上没有这个成员，不需要 release
+	s.checking = false
+	s.releaseAfterCheck = false
+	closers := make([]func(), 0, len(e.closers))
+	for _, c := range e.closers {
+		closers = append(closers, c)
+	}
 	a.dropSessionLocked(j.uid, j.ip, e)
+	a.cacheDenyLocked(admKey{j.uid, j.ip}, a.now())
 	a.panelOKLocked()
 	closer := a.cfg.Closer
 	a.mu.Unlock()
 	log.WithFields(log.Fields{"uid": j.uid, "ip": j.ip, "reason": res.Reason, "current": res.Current, "limit": res.Limit}).Info("准入保活被拒，关闭该 IP 的全部连接")
+	for _, c := range closers {
+		c()
+	}
 	if closer != nil {
 		closer(j.uid, j.ip)
 	}
@@ -631,8 +799,10 @@ type releaseItem struct {
 	uid  int
 	ip   string
 	sess *admSession
-	// forced 会话已从表中去掉（Forget），无条件发送；否则发出前要确认仍无链路、未被撤销
+	// forced 会话已从表中去掉（Forget、停止时放回），不再要求“仍无链路”；发送前仍要检查是否已被新会话取代
 	forced bool
+	// notBefore 宽限：这个时间之前不发（§7.6，期间有新连接即撤销）
+	notBefore time.Time
 }
 
 func (a *Admission) releaseWorker(ctx context.Context) {
@@ -659,31 +829,60 @@ func (a *Admission) releaseWorker(ctx context.Context) {
 	}
 }
 
-// claimRelease 发出前的检查：同一 (uid, ip) 在 release 发出前又有新连接就撤销（复用原会话，不重新 check）；
-// 否则把会话移出表
+// claimRelease 发出前的检查（锁内）：
+//   - 普通条目：同一 (uid, ip) 在此期间又有新连接就撤销（复用原会话，不重新 check）；保活在途就等它结束再发（M1）；否则把会话移出表；
+//   - 同一归并组（同 IP 的新会话，或 IPv6 同一 /64 的其他地址）仍有有效会话：面板成员仍在使用，不发（I2、I3）
 func (a *Admission) claimRelease(it releaseItem) bool {
-	if it.forced {
-		return true
-	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	e := a.entryLocked(it.uid, it.ip)
-	if e == nil || e.sess != it.sess || !it.sess.releasing || e.links > 0 {
-		return false
+	if !it.forced {
+		e := a.entryLocked(it.uid, it.ip)
+		if e == nil || e.sess != it.sess || !it.sess.releasing || e.links > 0 {
+			return false
+		}
+		if it.sess.checking {
+			it.sess.releaseAfterCheck = true
+			return false
+		}
+		a.dropSessionLocked(it.uid, it.ip, e)
 	}
-	a.dropSessionLocked(it.uid, it.ip, e)
-	return true
+	return !a.groupBusyLocked(it.uid, it.ip, it.sess)
 }
 
-// superseded 重试前检查：这个 (uid, ip) 已经建了新会话（新的 check 已刷新面板成员），旧 release 不再发
-func (a *Admission) superseded(it releaseItem) bool {
+// recheckGroup release 发出后同一归并组又建了会话（release 在途时的新连接）：立即补发 check，让面板重新登记成员（I3）
+func (a *Admission) recheckGroup(ctx context.Context, it releaseItem) {
+	a.mu.Lock()
+	g := admGroup(it.ip)
+	var jobs []checkJob
+	for ip, e := range a.users[it.uid] {
+		s := e.sess
+		if s == nil || s == it.sess || s.releasing || s.checking || admGroup(ip) != g {
+			continue
+		}
+		s.next = a.jitterLocked(a.now())
+		jobs = append(jobs, jobFor(it.uid, ip, s))
+	}
+	a.mu.Unlock()
+	a.runChecks(ctx, jobs)
+}
+
+func (a *Admission) groupBusy(it releaseItem) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	e := a.entryLocked(it.uid, it.ip)
-	return e != nil && e.sess != nil && e.sess != it.sess
+	return a.groupBusyLocked(it.uid, it.ip, it.sess)
 }
 
 func (a *Admission) processRelease(ctx context.Context, it releaseItem) {
+	if d := it.notBefore.Sub(a.now()); d > 0 {
+		t := time.NewTimer(d)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			a.queue.pushFront(it) // 尚未处理，原样放回
+			return
+		case <-t.C:
+		}
+	}
 	if !a.claimRelease(it) {
 		return
 	}
@@ -694,7 +893,9 @@ func (a *Admission) processRelease(ctx context.Context, it releaseItem) {
 	req := panel.SessionRequest{Port: it.sess.port, UserID: int64(it.uid), ClientIP: it.ip, ConnectionID: it.sess.connID}
 	var err error
 	for attempt := 0; ; attempt++ {
-		if attempt > 0 && a.superseded(it) {
+		if attempt > 0 && a.groupBusy(it) {
+			// 重试期间建了新会话：之前的尝试可能已在面板生效，补发 check 重新登记后放弃
+			a.recheckGroup(ctx, it)
 			return
 		}
 		rctx, cancel := context.WithTimeout(ctx, a.Timeout)
@@ -702,6 +903,7 @@ func (a *Admission) processRelease(ctx context.Context, it releaseItem) {
 		cancel()
 		if err == nil {
 			a.panelOK()
+			a.recheckGroup(ctx, it)
 			return
 		}
 		if attempt >= len(a.ReleaseBackoff) || ctx.Err() != nil {
@@ -713,8 +915,9 @@ func (a *Admission) processRelease(ctx context.Context, it releaseItem) {
 		}
 	}
 	if ctx.Err() != nil {
-		// 停止（重载）时未发出的 release 放回队首，重新启动后继续；会话已移出表，按强制发送处理
+		// 停止（重载）时未发出的 release 放回队首，重新启动后继续；会话已移出表，按强制发送处理（发送前仍检查新会话）
 		it.forced = true
+		it.notBefore = time.Time{}
 		a.queue.pushFront(it)
 		return
 	}
@@ -744,21 +947,21 @@ func (q *releaseQueue) signal() {
 	}
 }
 
-// push 入队；满了丢弃最旧的一条，返回是否丢弃
-func (q *releaseQueue) push(it releaseItem) (dropped bool) {
+// push 入队；满了丢弃最旧的一条并返回它
+func (q *releaseQueue) push(it releaseItem) (dropped releaseItem, ok bool) {
 	q.mu.Lock()
 	if len(q.items) >= q.cap {
+		dropped, ok = q.items[0], true
 		q.items[0] = releaseItem{}
 		q.items = q.items[1:]
-		dropped = true
 	}
 	q.items = append(q.items, it)
 	q.mu.Unlock()
 	q.signal()
-	return dropped
+	return dropped, ok
 }
 
-// pushFront 放回队首（停止时未发出的）；满了就丢弃
+// pushFront 放回队首（停止时未发出的）；满了就丢弃（这些条目的会话已移出表或仍按 releasing 由扫描兜底）
 func (q *releaseQueue) pushFront(it releaseItem) {
 	q.mu.Lock()
 	if len(q.items) < q.cap {

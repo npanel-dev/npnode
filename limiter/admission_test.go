@@ -113,6 +113,8 @@ func newTestAdmission(t *testing.T) (*Admission, *fakeChecker, *closeRecorder) {
 	a.ProbeInterval = 20 * time.Millisecond
 	a.OrphanAfter = 50 * time.Millisecond
 	a.ReleaseBackoff = []time.Duration{time.Millisecond, time.Millisecond, time.Millisecond}
+	a.ReleaseGrace = 10 * time.Millisecond
+	a.DenyCacheTTL = 0 // 拒绝负缓存单独测试
 	t.Cleanup(a.Stop)
 	return a, fc, cr
 }
@@ -135,7 +137,7 @@ func TestAdmitChecksFirstConnectionOnly(t *testing.T) {
 	if !a.Admit(1000000045, "203.0.113.7", 1, "vless", 443) {
 		t.Fatal("first connection must be allowed")
 	}
-	rel := a.Open(1000000045, "203.0.113.7")
+	rel := a.Open(1000000045, "203.0.113.7", nil)
 	defer rel()
 	if !a.Admit(1000000045, "::ffff:203.0.113.7", 1, "trojan", 8443) {
 		t.Fatal("reuse must be allowed")
@@ -182,7 +184,7 @@ func TestAdmitConcurrentFirstConnectionsSingleCheck(t *testing.T) {
 			defer wg.Done()
 			if a.Admit(7, "198.51.100.1", 1, "vless", 443) {
 				allowed.Add(1)
-				a.Open(7, "198.51.100.1")
+				a.Open(7, "198.51.100.1", nil)
 			}
 		}()
 	}
@@ -222,8 +224,8 @@ func TestReleaseAfterLastLinkCloses(t *testing.T) {
 	a, fc, _ := newTestAdmission(t)
 	a.Start()
 	a.Admit(5, "203.0.113.5", 1, "vless", 443)
-	r1 := a.Open(5, "203.0.113.5") // 入站 A
-	r2 := a.Open(5, "203.0.113.5") // 入站 B
+	r1 := a.Open(5, "203.0.113.5", nil) // 入站 A
+	r2 := a.Open(5, "203.0.113.5", nil) // 入站 B
 	r1()
 	r1() // 重复调用只生效一次
 	time.Sleep(20 * time.Millisecond)
@@ -246,14 +248,14 @@ func TestReleaseAfterLastLinkCloses(t *testing.T) {
 func TestReleaseCancelledByNewConnection(t *testing.T) {
 	a, fc, _ := newTestAdmission(t)
 	a.Admit(5, "203.0.113.5", 1, "vless", 443)
-	a.Open(5, "203.0.113.5")()
+	a.Open(5, "203.0.113.5", nil)()
 	if st := a.Stats(); st.Queued != 1 {
 		t.Fatalf("stats = %+v, want 1 queued", st)
 	}
 	if !a.Admit(5, "203.0.113.5", 1, "vless", 443) {
 		t.Fatal("reuse must be allowed")
 	}
-	rel := a.Open(5, "203.0.113.5")
+	rel := a.Open(5, "203.0.113.5", nil)
 	defer rel()
 	a.Start()
 	time.Sleep(30 * time.Millisecond)
@@ -272,7 +274,7 @@ func TestReleaseRetriesThenDrops(t *testing.T) {
 	fc.releaseErr = func(n int) error { return errors.New("500") }
 	a.Start()
 	a.Admit(5, "203.0.113.5", 1, "vless", 443)
-	a.Open(5, "203.0.113.5")()
+	a.Open(5, "203.0.113.5", nil)()
 	eventually(t, "4 attempts", func() bool { _, r := fc.counts(); return r == 4 })
 	time.Sleep(20 * time.Millisecond)
 	if _, r := fc.counts(); r != 4 {
@@ -288,7 +290,7 @@ func TestReleaseRetriesThenDrops(t *testing.T) {
 	}
 	b.Start()
 	b.Admit(6, "203.0.113.6", 1, "vless", 443)
-	b.Open(6, "203.0.113.6")()
+	b.Open(6, "203.0.113.6", nil)()
 	eventually(t, "2 attempts", func() bool { _, r := fc2.counts(); return r == 2 })
 	time.Sleep(20 * time.Millisecond)
 	if _, r := fc2.counts(); r != 2 {
@@ -320,7 +322,7 @@ func TestKeepaliveWhileLinksAlive(t *testing.T) {
 	a, fc, _ := newTestAdmission(t)
 	a.Start()
 	a.Admit(3, "203.0.113.3", 1, "vless", 443)
-	rel := a.Open(3, "203.0.113.3")
+	rel := a.Open(3, "203.0.113.3", nil)
 	eventually(t, "keepalives", func() bool { c, _ := fc.counts(); return c >= 4 })
 	fc.mu.Lock()
 	for _, c := range fc.checks {
@@ -342,9 +344,9 @@ func TestKeepaliveWhileLinksAlive(t *testing.T) {
 func TestKeepaliveDeniedClosesAllLinks(t *testing.T) {
 	a, fc, cr := newTestAdmission(t)
 	a.Admit(3, "203.0.113.3", 1, "vless", 443)
-	rel := a.Open(3, "203.0.113.3")
+	rel := a.Open(3, "203.0.113.3", nil)
 	a.Admit(3, "203.0.113.4", 1, "vless", 443)
-	keep := a.Open(3, "203.0.113.4")
+	keep := a.Open(3, "203.0.113.4", nil)
 	defer keep()
 	fc.set(func(req panel.SessionRequest) (*panel.SessionResult, error) {
 		if req.ClientIP == "203.0.113.3" {
@@ -382,7 +384,7 @@ func TestAdmitDegradesWhenPanelUnavailable(t *testing.T) {
 	if !a.Admit(8, "203.0.113.1", 1, "vless", 443) {
 		t.Fatal("first IP must be allowed in degraded mode")
 	}
-	keep := a.Open(8, "203.0.113.1")
+	keep := a.Open(8, "203.0.113.1", nil)
 	defer keep()
 	if st := a.Stats(); st.Degraded != 1 {
 		t.Fatalf("stats = %+v", st)
@@ -412,7 +414,7 @@ func TestRecoverRechecksDegradedSessions(t *testing.T) {
 		if !a.Admit(100+i, ip, 1, "vless", 443) {
 			t.Fatal("degraded allow")
 		}
-		defer a.Open(100+i, ip)()
+		defer a.Open(100+i, ip, nil)()
 	}
 	a.Start()
 	time.Sleep(60 * time.Millisecond) // 几轮试探都失败
@@ -441,7 +443,7 @@ func TestSuccessfulAdmitTriggersRecovery(t *testing.T) {
 	a.ProbeInterval = time.Hour
 	fc.set(unavailable)
 	a.Admit(1, "203.0.113.1", 1, "vless", 443)
-	defer a.Open(1, "203.0.113.1")()
+	defer a.Open(1, "203.0.113.1", nil)()
 	a.Start()
 	fc.set(nil)
 	a.Admit(2, "203.0.113.2", 1, "vless", 443)
@@ -475,7 +477,7 @@ func TestAdmitRejectsWhenTableFull(t *testing.T) {
 func TestForgetAndAdopt(t *testing.T) {
 	a, fc, cr := newTestAdmission(t)
 	a.Admit(1, "203.0.113.1", 1, "vless", 443)
-	rel := a.Open(1, "203.0.113.1")
+	rel := a.Open(1, "203.0.113.1", nil)
 	defer rel()
 	a.Start()
 	a.Forget(1)
@@ -501,7 +503,7 @@ func TestStartStopNoLeak(t *testing.T) {
 	base := runtime.NumGoroutine()
 	a, _, _ := newTestAdmission(t)
 	a.Admit(1, "203.0.113.1", 1, "vless", 443)
-	defer a.Open(1, "203.0.113.1")()
+	defer a.Open(1, "203.0.113.1", nil)()
 	for i := 0; i < 5; i++ {
 		a.Start()
 		a.Start()
@@ -552,7 +554,7 @@ func TestAdmissionConcurrentStress(t *testing.T) {
 				uid := 1 + (g+i)%5
 				ip := fmt.Sprintf("203.0.113.%d", i%3)
 				if a.Admit(uid, ip, 1+i%2, "vless", 443) {
-					rel := a.Open(uid, ip)
+					rel := a.Open(uid, ip, nil)
 					if i%4 == 0 {
 						time.Sleep(time.Millisecond)
 					}

@@ -210,7 +210,7 @@ func (l *Limiter) UpdateUserLimit(taguuid string, speedLimit, deviceLimit int) {
 		return
 	}
 	nu := *v.(*UserLimitInfo)
-	oldDevice := nu.DeviceLimit
+	oldDevice, oldSpeed := nu.DeviceLimit, nu.SpeedLimit
 	nu.SpeedLimit = speedLimit
 	nu.DeviceLimit = deviceLimit
 	l.UserLimitInfo.Store(taguuid, &nu)
@@ -222,6 +222,9 @@ func (l *Limiter) UpdateUserLimit(taguuid string, speedLimit, deviceLimit int) {
 		case oldDevice <= 0 && deviceLimit > 0:
 			l.Admission.Adopt(nu.UID, l.Protocol, l.Port)
 		}
+	}
+	if speedLimit == oldSpeed {
+		return // 只改设备数：不重建 bucket，避免给已有连接一次额外的突发额度
 	}
 	ref, ok := l.SpeedLimiter.Load(taguuid)
 	if !ok {
@@ -318,6 +321,11 @@ func (l *Limiter) CheckLimit(taguuid string, ip string, isTcp bool, noSSUDP bool
 		}
 		v, _ := l.SpeedLimiter.LoadOrStore(taguuid, rate.NewBucket(newUserBucket(limit)))
 		return v.(*rate.Bucket), false
+	} else if l.Admission != nil {
+		// 挂了准入（U5 生效）：不限速的连接也挂间接层（里面为 nil 即不限速），之后原地改为限速对已有连接立即生效。
+		// 代价是这些连接不再走 splice；未挂准入时保持原样：不挂、零开销
+		v, _ := l.SpeedLimiter.LoadOrStore(taguuid, rate.NewBucket(nil))
+		return v.(*rate.Bucket), false
 	} else {
 		return nil, false
 	}
@@ -340,6 +348,20 @@ func speedLimitBytesPerSecond(speedLimit int, bitPerSecond bool) int64 {
 	return limit
 }
 
+// Revoked 链路登记之后调用：这条链路的 (uid, ip) 在 Admit 放行后、登记前已被准入拒绝并关闭（M4），调用方应立即关闭它。
+// 未挂准入、用户不在限速器里或不受准入管理时返回 false
+func (l *Limiter) Revoked(taguuid string, ip string) bool {
+	if l.Admission == nil {
+		return false
+	}
+	v, ok := l.UserLimitInfo.Load(taguuid)
+	if !ok {
+		return false
+	}
+	u := v.(*UserLimitInfo)
+	return l.Admission.Revoked(u.UID, ip, u.DeviceLimit)
+}
+
 // ActiveOnline 在线上报是否按活跃连接口径（online_v1）
 func (l *Limiter) ActiveOnline() bool {
 	return l.Conns != nil && l.OnlineReport
@@ -349,6 +371,11 @@ func (l *Limiter) ActiveOnline() bool {
 // 未声明 online_v1 和 admission_v1、用户不在限速器里、uid 无效或 IP 无法解析时返回 nil，不登记。
 // ip 与 CheckLimit 用同一个来源（已按可信 XFF / PROXY protocol 解析后的地址），去掉 IPv4 映射前缀。
 func (l *Limiter) OpenConn(taguuid string, ip string) (release func()) {
+	return l.OpenConnWithCloser(taguuid, ip, nil)
+}
+
+// OpenConnWithCloser 同 OpenConn；closeLink 为关闭这条链路的函数，准入保活被拒时调用（只在挂了准入时登记）
+func (l *Limiter) OpenConnWithCloser(taguuid string, ip string, closeLink func()) (release func()) {
 	if l.Conns == nil {
 		return nil
 	}
@@ -369,7 +396,7 @@ func (l *Limiter) OpenConn(taguuid string, ip string) (release func()) {
 		return connRelease
 	}
 	// 准入与连接表共用这一个钩子：同一条链路在两张表里同时登记、同时释放
-	admRelease := l.Admission.Open(uid, ip)
+	admRelease := l.Admission.Open(uid, ip, closeLink)
 	var once sync.Once
 	return func() {
 		once.Do(func() {
