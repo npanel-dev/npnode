@@ -78,9 +78,47 @@ func TestSyncBecomesConnectedOnServerMessage(t *testing.T) {
 	deadline := time.Now().Add(2 * time.Second)
 	for !gc.IsSyncConnected() {
 		if time.Now().After(deadline) {
-			t.Fatal("stream that delivered a server message should be connected well before syncReadyDelay")
+			t.Fatal("stream that delivered a server message should be connected as soon as it delivers a server message")
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// silentSyncServer 接受 Sync 但永远不回任何消息：模拟反代（如 Cloudflare）把流挂住、响应头始终到不了节点
+type silentSyncServer struct {
+	nodev1.UnimplementedNodeServiceServer
+}
+
+func (s *silentSyncServer) Sync(stream nodev1.NodeService_SyncServer) error {
+	<-stream.Context().Done()
+	return nil
+}
+
+// 回归：流建立后 5 秒没报错就被视为可用，经反代挂住的流会吞掉心跳和流量，面板判节点离线。
+// 必须收到面板的消息（ServerHello 等）才算可用，否则继续走 HTTP。
+func TestSilentSyncStreamNeverReportsConnected(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := grpc.NewServer()
+	nodev1.RegisterNodeServiceServer(srv, &silentSyncServer{})
+	go func() { _ = srv.Serve(lis) }()
+	t.Cleanup(srv.Stop)
+
+	gc, err := NewGrpcClient(&conf.GrpcConfig{Enable: true, Addr: lis.Addr().String()}, "secret", 6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gc.Close()
+	gc.StartSync(context.Background(), nil)
+
+	deadline := time.Now().Add(6500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if gc.IsSyncConnected() {
+			t.Fatal("Sync stream that never delivered a server message must not be reported as connected")
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 
