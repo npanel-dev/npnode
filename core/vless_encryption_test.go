@@ -39,6 +39,11 @@ func TestVLESSDecryption(t *testing.T) {
 		{"0rtt 区间", mlkemProtocol("0rtt", "300-600s", "", k), "mlkem768x25519plus.native.300-600s." + k},
 		{"0rtt 票据为空用默认", mlkemProtocol("0rtt", "", "", k), "mlkem768x25519plus.native.600s." + k},
 		{"带服务端填充", mlkemProtocol("1rtt", "", "100-111-1111", k), "mlkem768x25519plus.native.0s.100-111-1111." + k},
+		{"加密为大写 NONE", &panel.Protocol{Encryption: " NONE "}, "none"},
+		{"加密方式与模式大小写混写", &panel.Protocol{
+			Encryption: " Mlkem768x25519plus ", EncryptionMode: "Native", EncryptionRTT: "0RTT",
+			EncryptionTicket: "600", EncryptionPrivateKey: k,
+		}, "mlkem768x25519plus.native.600s." + k},
 	}
 	for _, c := range cases {
 		got, err := vlessDecryption(c.p)

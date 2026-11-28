@@ -279,16 +279,17 @@ const defaultVLESSTicket = "600"
 // vlessDecryption 按 Xray 格式拼服务端 decryption：
 // mlkem768x25519plus.<模式>.<票据秒数>s[.<填充>].<私钥>
 // 1-RTT 的票据段固定为 0s；0-RTT 取面板票据时间，兼容带或不带 s 后缀，留空用默认值。
+// 加密方式、模式、RTT 不区分大小写并忽略首尾空格（如 Mlkem768x25519plus、Native），Xray 只认小写。
 func vlessDecryption(p *panel.Protocol) (string, error) {
-	switch p.Encryption {
+	switch strings.ToLower(strings.TrimSpace(p.Encryption)) {
 	case "", "none":
 		return "none", nil
 	case "mlkem768x25519plus":
 	default:
 		return "", logreport.Wrap(logreport.CodeVlessEncUnsupported, logreport.StageInbound,
-			fmt.Errorf("vless decryption method %s is not support", p.Encryption))
+			fmt.Errorf("vless decryption method %q is not support", p.Encryption))
 	}
-	mode := strings.TrimSpace(p.EncryptionMode)
+	mode := strings.ToLower(strings.TrimSpace(p.EncryptionMode))
 	if mode == "" {
 		return "", logreport.Wrap(logreport.CodeVlessEncModeEmpty, logreport.StageInbound,
 			fmt.Errorf("vless encryption mode is empty"))
@@ -299,7 +300,7 @@ func vlessDecryption(p *panel.Protocol) (string, error) {
 			fmt.Errorf("vless encryption private key is empty, generate a key pair in the panel"))
 	}
 	ticket := "0"
-	if strings.TrimSpace(p.EncryptionRTT) == "0rtt" {
+	if strings.ToLower(strings.TrimSpace(p.EncryptionRTT)) == "0rtt" {
 		ticket = strings.TrimSuffix(strings.TrimSpace(p.EncryptionTicket), "s")
 		if ticket == "" {
 			ticket = defaultVLESSTicket
