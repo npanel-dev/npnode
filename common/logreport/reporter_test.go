@@ -195,13 +195,15 @@ func TestRetrySameReportID(t *testing.T) {
 		}
 		return nil
 	}}
-	r := NewReporter(Options{Sender: s, Now: newClock().Now})
+	clk := newClock()
+	r := NewReporter(Options{Sender: s, Now: clk.Now})
 	r.Add(ev(CodeCoreStart, 0, "a"))
 	r.Resolve(&nodev1.LogResolve{Scope: ScopeServer})
 	ctx := context.Background()
 	if err := r.flush(ctx, false); err == nil {
 		t.Fatal("第一次应失败")
 	}
+	clk.Set(clk.Now(), time.Minute) // 越过失败退避
 	r.Add(ev(CodeCertUnavailable, 443, "后来的事件"))
 	if err := r.flush(ctx, false); err != nil {
 		t.Fatal(err)

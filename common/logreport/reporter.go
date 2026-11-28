@@ -22,6 +22,11 @@ const (
 	batchTrigger = 20
 	// maxQueued 为内存中（暂扣 + 待发 + 未发批次）事件总数上限，超过丢最旧。
 	maxQueued = 500
+	// 默认退避时长：Run 驱动的发送失败后从 defaultBackoffMin 起翻倍、封顶 defaultBackoffMax；
+	// 面板不支持（ErrUnsupported）时退避 defaultUnsupportedBackoff。
+	defaultBackoffMin         = 10 * time.Second
+	defaultBackoffMax         = 5 * time.Minute
+	defaultUnsupportedBackoff = 10 * time.Minute
 	// maxBatchEvents 为单批事件数上限。
 	maxBatchEvents = 20
 	// maxBatchBytes 为单批 protojson 序列化大小上限，远低于面板 gRPC 默认 4 MiB 接收上限。
@@ -37,6 +42,11 @@ const (
 var (
 	errNoSender = errors.New("logreport: 尚未设置 Sender")
 	errUnsent   = errors.New("logreport: 退出前仍有未发送的上报")
+	errBackoff  = errors.New("logreport: 发送失败后退避中")
+
+	// ErrUnsupported 表示面板不支持节点日志上报（旧面板，HTTP 404/405）。
+	// Sender 返回包装了它的错误时，Reporter 保留数据并长时间退避（UnsupportedBackoff）。
+	ErrUnsupported = errors.New("logreport: 面板不支持节点日志上报")
 )
 
 // Sender 负责把一批日志上报发送给面板（由 gRPC/HTTP 客户端实现）。
@@ -51,6 +61,11 @@ type Options struct {
 	SpoolPath string
 	Now       func() time.Time
 	NewID     func() string
+	// BackoffMin/BackoffMax 为 Run 驱动发送失败后的指数退避起点与上限（默认 10s / 5min）；
+	// UnsupportedBackoff 为收到 ErrUnsupported 后的退避时长（默认 10min）。
+	BackoffMin         time.Duration
+	BackoffMax         time.Duration
+	UnsupportedBackoff time.Duration
 }
 
 // item 为一条尚未进入批次的事件；holdUntil 非零表示在该时刻前处于暂扣状态。
@@ -69,6 +84,10 @@ type Reporter struct {
 	now       func() time.Time
 	newID     func() string
 
+	backoffMin         time.Duration
+	backoffMax         time.Duration
+	unsupportedBackoff time.Duration
+
 	notify  chan struct{} // 可发送事件满 batchTrigger 时通知 Run
 	sem     chan struct{} // 串行化发送，容量 1
 	spoolMu sync.Mutex    // 串行化 spool 文件读写
@@ -82,6 +101,9 @@ type Reporter struct {
 	resolveKey map[string]*nodev1.LogResolve // scope|protocol|port -> resolve
 	batches    []*nodev1.LogReport           // 已分配 ReportId、尚未发送成功的批次
 	batchEvs   int                           // batches 中的事件总数
+
+	backoff      time.Duration // 当前退避时长，0 表示未退避
+	backoffUntil time.Time     // Run 驱动的发送在该时刻前跳过
 }
 
 // NewReporter 创建 Reporter。
@@ -104,7 +126,17 @@ func NewReporter(opts Options) *Reporter {
 	if r.newID == nil {
 		r.newID = defaultIDGen()
 	}
+	r.backoffMin = durOr(opts.BackoffMin, defaultBackoffMin)
+	r.backoffMax = durOr(opts.BackoffMax, defaultBackoffMax)
+	r.unsupportedBackoff = durOr(opts.UnsupportedBackoff, defaultUnsupportedBackoff)
 	return r
+}
+
+func durOr(d, def time.Duration) time.Duration {
+	if d > 0 {
+		return d
+	}
+	return def
 }
 
 // defaultIDGen 生成 "bootID:seq" 形式的 ID，bootID 每个 Reporter 随机生成。
@@ -120,10 +152,11 @@ func defaultIDGen() func() string {
 	}
 }
 
-// SetSender 设置或替换 Sender（启动中途拿到客户端、热重载时调用）。
+// SetSender 设置或替换 Sender（启动中途拿到客户端、热重载时调用）。换了通道，清除失败退避。
 func (r *Reporter) SetSender(s Sender) {
 	r.mu.Lock()
 	r.sender = s
+	r.backoff, r.backoffUntil = 0, time.Time{}
 	r.mu.Unlock()
 }
 
@@ -255,6 +288,11 @@ func (r *Reporter) Resolve(res *nodev1.LogResolve) {
 	r.resolveKey[key] = res
 }
 
+// Flush 执行一轮 Run 驱动的发送（遵守节流暂扣与失败退避）。
+func (r *Reporter) Flush(ctx context.Context) error {
+	return r.flush(ctx, false)
+}
+
 // Run 每 flushInterval 或可发送事件满 batchTrigger 条时发送，直到 ctx 结束。
 func (r *Reporter) Run(ctx context.Context) {
 	t := time.NewTicker(flushInterval)
@@ -267,7 +305,7 @@ func (r *Reporter) Run(ctx context.Context) {
 		case <-r.notify:
 		}
 		// 发送失败保留数据待下次重发；这里不能打 Warn 及以上日志，否则会经 hook 回流到自身
-		_ = r.flush(ctx, false)
+		_ = r.Flush(ctx)
 	}
 }
 
@@ -304,12 +342,17 @@ func (r *Reporter) FlushFatal(timeout time.Duration) error {
 }
 
 // flush 把可发送事件与 resolve 组成新批次，并按顺序发送全部未发批次。
-// all 为真时忽略节流暂扣，且即使没有 Sender 也会组批（供落盘）。
+// all 为真时忽略节流暂扣与失败退避，且即使没有 Sender 也会组批（供落盘）。
+// 非 all（Run 驱动）时处于退避期直接返回，不组批：待发事件继续按键合并。
 func (r *Reporter) flush(ctx context.Context, all bool) error {
 	r.mu.Lock()
 	if r.sender == nil && !all {
 		r.mu.Unlock()
 		return errNoSender
+	}
+	if !all && r.now().Before(r.backoffUntil) {
+		r.mu.Unlock()
+		return errBackoff
 	}
 	r.buildBatchLocked(all)
 	r.mu.Unlock()
@@ -337,12 +380,36 @@ func (r *Reporter) flush(ctx context.Context, all bool) error {
 			return errNoSender
 		}
 		if err := s.SendLogs(ctx, b); err != nil {
+			// ctx 结束（退出预算用尽）不是面板的问题，不计入退避
+			if ctx.Err() == nil {
+				r.mu.Lock()
+				r.backoffLocked(err)
+				r.mu.Unlock()
+			}
 			return err
 		}
 		r.mu.Lock()
 		r.removeBatchLocked(b.ReportId)
+		r.backoff, r.backoffUntil = 0, time.Time{}
 		r.mu.Unlock()
 	}
+}
+
+// backoffLocked 记录一次发送失败：ErrUnsupported 退避 unsupportedBackoff，其余按指数退避。
+func (r *Reporter) backoffLocked(err error) {
+	if errors.Is(err, ErrUnsupported) {
+		r.backoffUntil = r.now().Add(r.unsupportedBackoff)
+		return
+	}
+	switch {
+	case r.backoff <= 0:
+		r.backoff = r.backoffMin
+	case r.backoff*2 > r.backoffMax:
+		r.backoff = r.backoffMax
+	default:
+		r.backoff *= 2
+	}
+	r.backoffUntil = r.now().Add(r.backoff)
 }
 
 // buildBatchLocked 把可发送（或 all 时全部）待发事件与 resolve 组成新批次：

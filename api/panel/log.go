@@ -3,6 +3,7 @@ package panel
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"strconv"
 
 	"github.com/go-resty/resty/v2"
@@ -66,8 +67,12 @@ func (c *ClientV2) ReportLogs(ctx context.Context, r *nodev1.LogReport) error {
 	if err != nil {
 		return fmt.Errorf("上报节点日志失败: %w", err)
 	}
-	if resp.StatusCode() >= 400 {
-		return fmt.Errorf("上报节点日志失败: HTTP %d", resp.StatusCode())
+	switch code := resp.StatusCode(); {
+	case code == http.StatusNotFound || code == http.StatusMethodNotAllowed:
+		// 旧面板没有该接口：交给 Reporter 长时间退避
+		return fmt.Errorf("%w: HTTP %d", logreport.ErrUnsupported, code)
+	case code >= 400:
+		return fmt.Errorf("上报节点日志失败: HTTP %d", code)
 	}
 	return nil
 }
@@ -85,7 +90,7 @@ type LogSender struct {
 
 // SendLogs 实现 logreport.Sender。不得输出 Info 及以上日志，避免反馈回路。
 func (s LogSender) SendLogs(ctx context.Context, r *nodev1.LogReport) error {
-	if s.Grpc != nil && s.Grpc.IsSyncConnected() {
+	if s.Grpc != nil && s.Grpc.IsSyncConnected() && s.Grpc.logsEnabled() {
 		err := s.Grpc.SendLogs(ctx, r)
 		if err == nil {
 			return nil
