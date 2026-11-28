@@ -1,6 +1,7 @@
 package dispatcher
 
 import (
+	"strings"
 	sync "sync"
 
 	"github.com/xtls/xray-core/common"
@@ -10,8 +11,15 @@ import (
 type ManagedWriter struct {
 	writer  buf.Writer
 	manager *LinkManager
-	// release 活跃连接表（online_v1）的释放函数，nil 表示未登记。可重复调用，只生效一次
+	// release 活跃连接表（online_v1）与准入会话表（admission_v1）的释放函数，nil 表示未登记。可重复调用，只生效一次
 	release func()
+	// ip 链路的来源 IP（与 CheckLimit 同一来源，已去掉 IPv4 映射前缀），CloseByIP 按它匹配
+	ip string
+}
+
+// normalizeLinkIP 与限速器、连接表的 IP 口径一致：去掉 IPv4 映射前缀
+func normalizeLinkIP(ip string) string {
+	return strings.TrimPrefix(ip, "::ffff:")
 }
 
 // releaseOnline 从活跃连接表注销这条链路
@@ -68,6 +76,31 @@ func (m *LinkManager) CloseAll() {
 	m.mu.Unlock()
 
 	for w, r := range links {
+		common.Close(w.writer)
+		common.Interrupt(r)
+		w.releaseOnline()
+	}
+}
+
+// CloseByIP 断开该用户来自 ip 的全部链路（准入保活被拒，A2）。与 CloseAll 不同，不置 closed：
+// 用户仍在、仍可从其他 IP 连接，之后的新链路照常纳入管理
+func (m *LinkManager) CloseByIP(ip string) {
+	ip = normalizeLinkIP(ip)
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return
+	}
+	victims := make(map[*ManagedWriter]buf.Reader)
+	for w, r := range m.links {
+		if w.ip == ip {
+			victims[w] = r
+			delete(m.links, w)
+		}
+	}
+	m.mu.Unlock()
+
+	for w, r := range victims {
 		common.Close(w.writer)
 		common.Interrupt(r)
 		w.releaseOnline()

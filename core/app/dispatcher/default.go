@@ -230,6 +230,7 @@ func (d *DefaultDispatcher) getLink(ctx context.Context, network net.Network) (*
 			writer:  uplinkWriter,
 			manager: lm,
 			release: trackOnlineLink(ctx, limit, user.Email, sessionInbound.Source.Address.IP().String()),
+			ip:      normalizeLinkIP(sessionInbound.Source.Address.IP().String()),
 		}
 		lm.AddLink(managedWriter, outboundLink.Reader)
 		inboundLink.Writer = managedWriter
@@ -414,6 +415,7 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 			writer:  outbound.Writer,
 			manager: lm,
 			release: trackOnlineLink(ctx, limit, user.Email, sessionInbound.Source.Address.IP().String()),
+			ip:      normalizeLinkIP(sessionInbound.Source.Address.IP().String()),
 		}
 		outbound.Writer = managedWriter
 		if w != nil {
