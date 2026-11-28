@@ -41,6 +41,10 @@ type ServerApiConfig struct {
 	// TrafficIdempotent HTTP 流量上报带 boot_id、递增 sequence 与 reported_at，失败后用同一批次号和同一内容重发（T3），
 	// 面板 traffic_report_mode 为 shadow / enforce 时据此去重，off 时忽略。默认关闭，请求体与旧版一致；与 SeatV1、OnlineV1 相互独立。
 	TrafficIdempotent bool `mapstructure:"TrafficIdempotent"`
+	// AdmissionV1 向面板声明 admission_v1：对 device_limit > 0 的条目执行实时准入（session/check、保活、release），
+	// 并在仅限速或设备数变化时原地更新用户、不断开连接（U5）。面板 seat_realtime_admission 默认打开，声明即生效。
+	// 默认关闭，与旧版行为一致；与 SeatV1、OnlineV1 相互独立。
+	AdmissionV1 bool `mapstructure:"AdmissionV1"`
 }
 
 type NodeApiConfig struct {

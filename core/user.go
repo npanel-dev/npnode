@@ -92,6 +92,13 @@ func (vc *XrayCore) closeUserLinksLocked(user string) {
 	}
 }
 
+// CloseUserLinksByIP 断开用户（taguuid）来自 ip 的全部连接，用户本身保留（准入保活被拒，A2）
+func (vc *XrayCore) CloseUserLinksByIP(taguuid, ip string) {
+	if v, ok := vc.dispatcher.LinkManagers.Load(taguuid); ok {
+		v.(*dispatcher.LinkManager).CloseByIP(ip)
+	}
+}
+
 // retireUserCounterLocked 用户被移除：计数器移出计数表，但连同 uid 留到下一次上报时读出（调用方持有 users.mapLock）。
 // 连接持有计数器指针，关闭过程中仍可能写入，所以不在这里清零，而是在上报时一次读出。
 func (vc *XrayCore) retireUserCounterLocked(tag, user string) {

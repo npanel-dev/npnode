@@ -7,6 +7,7 @@ import (
 	"github.com/npanel-dev/npnode/common/format"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/npanel-dev/npnode/common/counter"
@@ -153,8 +154,8 @@ func (*DefaultDispatcher) Close() error { return nil }
 // 连接上下文结束（入站处理返回时 xray 取消上下文；入站出错时只 Interrupt 不 Close 的路径靠它兜底；
 // XUDP 的 TimeoutOnly 上下文除外）。没有子会话的空闲 mux 承载连接不经过这里，不算在线。
 // 所有协议（含 UDP 类、SOCKS / HTTP 入站）的用户链路都经过 getLink 或 DispatchLink，在这里统一登记。
-func trackOnlineLink(ctx context.Context, limit *limiter.Limiter, email, ip string) func() {
-	release := limit.OpenConn(email, ip)
+func trackOnlineLink(ctx context.Context, limit *limiter.Limiter, email, ip string, closeLink func()) func() {
+	release := limit.OpenConnWithCloser(email, ip, closeLink)
 	if release == nil {
 		return nil
 	}
@@ -168,6 +169,18 @@ func trackOnlineLink(ctx context.Context, limit *limiter.Limiter, email, ip stri
 		stop()
 		release()
 	}
+}
+
+// revokeNext 仅供测试：在链路登记之后、撤销检查之前执行，模拟这段窗口里会话被移除。原子变量，测试并行或后台 goroutine 读取时无数据竞争
+var revokeNext atomic.Pointer[func()]
+
+// linkRevoked 链路加入管理器之后检查（M4）：Admit 放行后、加入前该 (uid, ip) 已被准入拒绝并关闭过，
+// 这条链路没被关到，调用方要立即关闭它
+func linkRevoked(limit *limiter.Limiter, email, ip string) bool {
+	if hook := revokeNext.Load(); hook != nil {
+		(*hook)()
+	}
+	return limit.Revoked(email, ip)
 }
 
 func (d *DefaultDispatcher) getLink(ctx context.Context, network net.Network) (*transport.Link, *transport.Link, *limiter.Limiter, error) {
@@ -226,12 +239,22 @@ func (d *DefaultDispatcher) getLink(ctx context.Context, network net.Network) (*
 		} else {
 			lm = lmloaded.(*LinkManager)
 		}
+		srcIP := sessionInbound.Source.Address.IP().String()
 		managedWriter := &ManagedWriter{
 			writer:  uplinkWriter,
 			manager: lm,
-			release: trackOnlineLink(ctx, limit, user.Email, sessionInbound.Source.Address.IP().String()),
+			ip:      normalizeLinkIP(srcIP),
 		}
+		upReader := outboundLink.Reader
+		managedWriter.setRelease(trackOnlineLink(ctx, limit, user.Email, srcIP, func() { lm.CloseWriter(managedWriter, upReader) }))
 		lm.AddLink(managedWriter, outboundLink.Reader)
+		if linkRevoked(limit, user.Email, srcIP) {
+			errors.LogInfo(ctx, "Limited ", user.Email, " by admission (revoked)")
+			lm.CloseWriter(managedWriter, upReader)
+			common.Close(outboundLink.Writer)
+			common.Interrupt(inboundLink.Reader)
+			return nil, nil, nil, errors.New("Limited ", user.Email, " by admission")
+		}
 		inboundLink.Writer = managedWriter
 		if w != nil {
 			sessionInbound.CanSpliceCopy = 3
@@ -410,11 +433,14 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 		} else {
 			lm = lmloaded.(*LinkManager)
 		}
+		srcIP := sessionInbound.Source.Address.IP().String()
 		managedWriter := &ManagedWriter{
 			writer:  outbound.Writer,
 			manager: lm,
-			release: trackOnlineLink(ctx, limit, user.Email, sessionInbound.Source.Address.IP().String()),
+			ip:      normalizeLinkIP(srcIP),
 		}
+		origReader := outbound.Reader
+		managedWriter.setRelease(trackOnlineLink(ctx, limit, user.Email, srcIP, func() { lm.CloseWriter(managedWriter, origReader) }))
 		outbound.Writer = managedWriter
 		if w != nil {
 			sessionInbound.CanSpliceCopy = 3
@@ -435,6 +461,12 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 			Counter: &ts.UpCounter,
 		}
 		lm.AddLink(managedWriter, outbound.Reader)
+		if linkRevoked(limit, user.Email, srcIP) {
+			errors.LogInfo(ctx, "Limited ", user.Email, " by admission (revoked)")
+			lm.CloseWriter(managedWriter, outbound.Reader)
+			common.Interrupt(outbound.Reader)
+			return errors.New("Limited ", user.Email, " by admission")
+		}
 		outbound.Writer = &dispatcher.SizeStatWriter{
 			Counter: downcounter,
 			Writer:  outbound.Writer,

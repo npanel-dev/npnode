@@ -18,6 +18,10 @@ Api:
   # HTTP 流量上报带批次号（boot_id + 递增 sequence），失败后原样重发，面板可靠回执（traffic_report_mode=shadow/enforce）据此去重。
   # 与上面两项相互独立；关闭时 HTTP 流量请求体与旧版一致。gRPC 上报本来就带 report_id，不受影响。
   TrafficIdempotent: false
+  # 声明 admission_v1：对 device_limit > 0 的条目实时准入（同一 (id, IP) 首连接 session/check、每 50～60 秒保活、
+  # 最后一条连接关闭后 release；面板不可用时按本机规则降级），并在只改限速 / 设备数时原地更新、不断开连接。
+  # 面板 seat_realtime_admission 默认打开，声明即生效，建议先少量灰度。与上面三项相互独立。
+  AdmissionV1: false
 
 Grpc:
   # 默认开启：用 gRPC 推送用户和配置变更、上报流量。Addr 留空时从 Api.ApiHost 推出（同一个域名）。

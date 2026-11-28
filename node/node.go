@@ -12,6 +12,7 @@ import (
 	"github.com/npanel-dev/npnode/common/task"
 	"github.com/npanel-dev/npnode/conf"
 	vCore "github.com/npanel-dev/npnode/core"
+	"github.com/npanel-dev/npnode/limiter"
 )
 
 type Node struct {
@@ -25,6 +26,10 @@ type Node struct {
 	pushInterval int
 	// configCheck 合并面板连续推送的配置变更：已有检查在排队时不再重复
 	configCheck chan struct{}
+	// sessionClient 准入接口客户端（admission_v1）；未声明时为 nil
+	sessionClient *panel.SessionClient
+	serverID      int
+	admission     *limiter.Admission
 }
 
 func New(core *vCore.XrayCore, config *conf.Conf, serverconfig *panel.ServerConfigResponse, grpcClient *panel.GrpcClient) (*Node, error) {
@@ -43,6 +48,10 @@ func New(core *vCore.XrayCore, config *conf.Conf, serverconfig *panel.ServerConf
 		pullinterval = 60
 	}
 	node.statusClient = panel.NewClientV2(&config.ApiConfig)
+	node.serverID = config.ApiConfig.ServerId
+	if panel.AdmissionV1Enabled() {
+		node.sessionClient = panel.NewSessionClient(&config.ApiConfig)
+	}
 	node.grpcClient = grpcClient
 	node.pushInterval = pushinterval
 	for i, nodeconfig := range *serverconfig.Data.Protocols {
@@ -88,7 +97,29 @@ func (n *Node) InheritTraffic(old *Node) {
 	}
 }
 
+// startAdmission admission_v1：建立（或沿用）进程级准入并启动后台循环，须在入站（限速器）启动之前；
+// 未声明时撤掉进程级准入（重载时关闭了开关）
+func (n *Node) startAdmission() {
+	if n.sessionClient == nil {
+		limiter.DisableAdmission()
+		return
+	}
+	core := n.core
+	n.admission = limiter.EnsureAdmission(limiter.AdmissionConfig{
+		Checker:  n.sessionClient,
+		ServerID: int64(n.serverID),
+		// 保活被拒：关闭本进程所有入站上该 (uid, ip) 的全部连接（严格模式要求跨所有入站）
+		Closer: func(uid int, ip string) {
+			for _, taguuid := range limiter.TagUUIDsForUID(uid) {
+				core.CloseUserLinksByIP(taguuid, ip)
+			}
+		},
+	})
+	n.admission.Start()
+}
+
 func (n *Node) Start() error {
+	n.startAdmission()
 	if len(n.controllers) == 0 {
 		n.startServerStatusTask()
 		log.Info("服务器还没有协议，已对接面板，暂不启动入站")
@@ -128,6 +159,11 @@ func (n *Node) Close() {
 		}
 	}
 	n.controllers = nil
+	// 准入后台循环随节点停止；会话表保留，重载后的新节点沿用（已有连接关闭时仍能对上并 release）
+	if n.admission != nil {
+		n.admission.Stop()
+		n.admission = nil
+	}
 }
 
 func (n *Node) startServerStatusTask() {

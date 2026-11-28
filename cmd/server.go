@@ -89,6 +89,7 @@ func serverHandle(_ *cobra.Command, _ []string) {
 	panel.SetSeatV1(c.ApiConfig.SeatV1)
 	panel.SetOnlineV1(c.ApiConfig.OnlineV1)
 	panel.SetTrafficIdempotent(c.ApiConfig.TrafficIdempotent)
+	panel.SetAdmissionV1(c.ApiConfig.AdmissionV1)
 	p := panel.NewClientV2(&c.ApiConfig)
 	serverconfig, err := panel.GetServerConfig(context.Background(), p)
 	if err != nil {
@@ -205,6 +206,7 @@ func reload(config string, nodes **node.Node, xcore **core.XrayCore, grpcClient 
 	panel.SetSeatV1(newConf.ApiConfig.SeatV1)
 	panel.SetOnlineV1(newConf.ApiConfig.OnlineV1)
 	panel.SetTrafficIdempotent(newConf.ApiConfig.TrafficIdempotent)
+	panel.SetAdmissionV1(newConf.ApiConfig.AdmissionV1)
 	p := panel.NewClientV2(&newConf.ApiConfig)
 	serverconfig, err := panel.GetServerConfig(context.Background(), p)
 	if err != nil {

@@ -78,3 +78,44 @@ func TestSpeedLimitUnitIsFixedAtAddLimiter(t *testing.T) {
 		t.Fatalf("bucket = %v, want 1310720 B/s fixed at AddLimiter", bucket)
 	}
 }
+
+// U5：只改限速 / 设备数时原地更新 UserLimitInfo，并替换已有 bucket（已有连接持有同一个间接层，立即生效）
+func TestUpdateUserLimitReplacesBucketInPlace(t *testing.T) {
+	panel.SetSeatV1(true)
+	t.Cleanup(func() { panel.SetSeatV1(false) })
+	Init()
+	const tag = "limiter-u5"
+	l := AddLimiter(tag, []panel.UserInfo{{Id: 9, Uuid: "u-9", SpeedLimit: 524288}}, nil)
+	t.Cleanup(func() { DeleteLimiter(tag) })
+	key := format.UserTag(tag, "u-9")
+	ref, reject := l.CheckLimit(key, "203.0.113.7", true, true)
+	if reject || ref == nil || ref.Capacity() != 65536 {
+		t.Fatalf("initial bucket = %v reject=%v", ref, reject)
+	}
+	l.UpdateUserLimit(key, 4194304, 1)
+	if ref.Capacity() != 524288 {
+		t.Fatalf("after update capacity = %d, want 524288", ref.Capacity())
+	}
+	v, _ := l.UserLimitInfo.Load(key)
+	if u := v.(*UserLimitInfo); u.SpeedLimit != 4194304 || u.DeviceLimit != 1 || u.UID != 9 {
+		t.Fatalf("UserLimitInfo = %+v", u)
+	}
+	again, _ := l.CheckLimit(key, "203.0.113.7", true, true)
+	if again != ref {
+		t.Fatal("新连接应拿到同一个间接层")
+	}
+	l.UpdateUserLimit(key, 0, 0)
+	if ref.Load() != nil {
+		t.Fatal("限速改为 0 后应不限速")
+	}
+	// 之后再改回限速：新连接拿到新速率
+	l.UpdateUserLimit(key, 524288, 0)
+	if again, _ := l.CheckLimit(key, "203.0.113.7", true, true); again == nil || again.Capacity() != 65536 {
+		t.Fatalf("bucket = %v", again)
+	}
+	// 不在限速器里的用户：什么都不做
+	l.UpdateUserLimit(format.UserTag(tag, "nobody"), 1, 1)
+	if _, ok := l.UserLimitInfo.Load(format.UserTag(tag, "nobody")); ok {
+		t.Fatal("UpdateUserLimit 不应新增用户")
+	}
+}

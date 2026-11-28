@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/npanel-dev/npnode/api/panel"
+	"github.com/npanel-dev/npnode/common/format"
 	vCore "github.com/npanel-dev/npnode/core"
 	nodev1 "github.com/npanel-dev/npnode/proto/node/v1"
 	log "github.com/sirupsen/logrus"
@@ -92,6 +93,10 @@ func (c *Controller) forgetRejectedLocked(removed []panel.UserInfo) {
 // 单条失败只跳过（内核已记日志），失败的用户不记入本地，下一轮同步会重试，也不会反复 already exists；
 // 只有整个入站不可用时才返回错误。
 func (c *Controller) applyChangesLocked(deleted, added []panel.UserInfo) (addedN, deletedN int, err error) {
+	var updates []limitUpdate
+	if c.inPlaceUpdateEnabled() {
+		deleted, added, updates = splitLimitUpdates(deleted, added)
+	}
 	if len(deleted) > 0 {
 		removed, err := c.server.DelUsers(deleted, c.tag, c.info)
 		c.userList = removeUsers(c.userList, removed)
@@ -104,6 +109,8 @@ func (c *Controller) applyChangesLocked(deleted, added []panel.UserInfo) (addedN
 			log.WithFields(log.Fields{"tag": c.tag, "err": err}).Warn("部分用户移除失败，保留到下一轮重试")
 		}
 	}
+	// 顺序：删除 → 原地更新 → 新增（三者互不重叠，与 DIFF 的 removed→users 一致）
+	c.applyLimitUpdatesLocked(updates)
 	if len(added) > 0 {
 		ok, err := c.server.AddUsers(&vCore.AddUsersParams{Tag: c.tag, NodeInfo: c.info, Users: added, Quiet: c.isRejectedLocked})
 		if err != nil {
@@ -115,6 +122,71 @@ func (c *Controller) applyChangesLocked(deleted, added []panel.UserInfo) (addedN
 		addedN = len(ok)
 	}
 	return addedN, deletedN, nil
+}
+
+// inPlaceUpdateEnabled U5 是否生效：只在声明 admission_v1（限速器挂了准入）时。
+// 开启准入后名额条目的 device_limit 会随面板 seat_realtime_admission 在 0/1 之间切换，删旧加新会让全量用户断线重连；
+// 未声明时保持原先的删旧加新
+func (c *Controller) inPlaceUpdateEnabled() bool {
+	return c.limiter != nil && c.limiter.Admission != nil
+}
+
+// limitUpdate 同一用户（id、uuid 都相同）只有限速或设备数变化
+type limitUpdate struct {
+	old, new panel.UserInfo
+}
+
+func identityKey(u panel.UserInfo) string {
+	return strconv.Itoa(u.Id) + "|" + u.Uuid
+}
+
+// splitLimitUpdates 从“待删除 + 待新增”中挑出 id、uuid 都相同的配对，作为原地更新（U5）；其余照旧删除、新增
+func splitLimitUpdates(deleted, added []panel.UserInfo) (del, add []panel.UserInfo, updates []limitUpdate) {
+	if len(deleted) == 0 || len(added) == 0 {
+		return deleted, added, nil
+	}
+	idx := make(map[string]int, len(deleted))
+	for i, u := range deleted {
+		if _, dup := idx[identityKey(u)]; !dup {
+			idx[identityKey(u)] = i
+		}
+	}
+	paired := make(map[int]bool)
+	for _, u := range added {
+		if i, ok := idx[identityKey(u)]; ok && !paired[i] {
+			paired[i] = true
+			updates = append(updates, limitUpdate{old: deleted[i], new: u})
+			continue
+		}
+		add = append(add, u)
+	}
+	for i, u := range deleted {
+		if !paired[i] {
+			del = append(del, u)
+		}
+	}
+	return del, add, updates
+}
+
+// applyLimitUpdatesLocked 原地更新：不删用户、不断连接，只更新限速器（UserLimitInfo 与 bucket）和本地列表
+func (c *Controller) applyLimitUpdatesLocked(updates []limitUpdate) {
+	if len(updates) == 0 {
+		return
+	}
+	pos := make(map[string]int, len(c.userList))
+	for i, u := range c.userList {
+		pos[userSyncKey(u)] = i
+	}
+	for _, up := range updates {
+		i, ok := pos[userSyncKey(up.old)]
+		if !ok {
+			continue
+		}
+		c.limiter.UpdateUserLimit(format.UserTag(c.tag, up.new.Uuid), up.new.SpeedLimit, up.new.DeviceLimit)
+		c.userList[i] = up.new
+		delete(pos, userSyncKey(up.old))
+	}
+	log.WithField("节点", c.tag).Infof("原地更新 %d 个用户的限速 / 设备数", len(updates))
 }
 
 func removeUsers(list, remove []panel.UserInfo) []panel.UserInfo {
