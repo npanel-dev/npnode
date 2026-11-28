@@ -2,12 +2,15 @@ package dispatcher
 
 import (
 	"context"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/npanel-dev/npnode/api/panel"
 	"github.com/npanel-dev/npnode/common/format"
 	"github.com/npanel-dev/npnode/limiter"
 	"github.com/xtls/xray-core/common"
+	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/net"
 )
 
@@ -127,4 +130,145 @@ func TestCloseByIPConcurrent(t *testing.T) {
 		<-done
 	}
 	waitActive(t, l, 0)
+}
+
+// scriptChecker 首次 check 放行，之后按 deny 决定（用于保活被拒）
+type scriptChecker struct {
+	mu   sync.Mutex
+	deny bool
+}
+
+func (c *scriptChecker) set(deny bool) { c.mu.Lock(); c.deny = deny; c.mu.Unlock() }
+
+func (c *scriptChecker) Check(context.Context, panel.SessionRequest) (*panel.SessionResult, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return &panel.SessionResult{Allowed: !c.deny, Reason: "device_limit"}, nil
+}
+
+func (c *scriptChecker) Release(context.Context, panel.SessionRequest) error { return nil }
+
+func setupAdmissionLimiter(t *testing.T, speed int) (*limiter.Limiter, *limiter.Admission, *scriptChecker) {
+	t.Helper()
+	panel.SetAdmissionV1(true)
+	panel.SetSeatV1(true)
+	limiter.Init()
+	sc := &scriptChecker{}
+	a := limiter.EnsureAdmission(limiter.AdmissionConfig{Checker: sc, ServerID: 1})
+	a.KeepaliveMin, a.KeepaliveMax = 10*time.Millisecond, 10*time.Millisecond
+	a.ScanInterval = 5 * time.Millisecond
+	a.DenyCacheTTL = 0
+	l := limiter.AddInboundLimiter(onlineTag, "vless", 443, []panel.UserInfo{{Id: 1000000045, Uuid: "u-45", DeviceLimit: 1, SpeedLimit: speed}}, nil)
+	t.Cleanup(func() {
+		limiter.DeleteLimiter(onlineTag)
+		limiter.DisableAdmission()
+		panel.SetAdmissionV1(false)
+		panel.SetSeatV1(false)
+	})
+	return l, a, sc
+}
+
+func linkCount(d *DefaultDispatcher) int {
+	v, ok := d.LinkManagers.Load(format.UserTag(onlineTag, "u-45"))
+	if !ok {
+		return 0
+	}
+	return v.(*LinkManager).Len()
+}
+
+// V2：保活被拒时按链路登记的关闭函数关闭，重载前旧 dispatcher 上的链路也能关掉（Closer 只认识当前内核）
+func TestDeniedKeepaliveClosesLinksOnAllDispatchers(t *testing.T) {
+	l, a, sc := setupAdmissionLimiter(t, 0)
+	oldD, newD := &DefaultDispatcher{}, &DefaultDispatcher{}
+	if _, _, _, err := oldD.getLink(onlineCtx(context.Background(), "203.0.113.7"), net.Network_TCP); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := newD.getLink(onlineCtx(context.Background(), "203.0.113.7"), net.Network_TCP); err != nil {
+		t.Fatal(err)
+	}
+	if linkCount(oldD) != 1 || linkCount(newD) != 1 {
+		t.Fatal("links")
+	}
+	sc.set(true)
+	a.Start()
+	waitFor := func(cond func() bool) {
+		deadline := time.Now().Add(3 * time.Second)
+		for !cond() {
+			if time.Now().After(deadline) {
+				t.Fatalf("timeout: old=%d new=%d active=%d", linkCount(oldD), linkCount(newD), l.Conns.Active())
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	waitFor(func() bool { return linkCount(oldD) == 0 && linkCount(newD) == 0 && l.Conns.Active() == 0 })
+}
+
+// M4：Admit 放行后、链路登记前该 (uid, ip) 已被拒绝移除：登记后发现已撤销，立即关闭并让 getLink 失败
+func TestGetLinkRevokedAfterAdmit(t *testing.T) {
+	l, a, _ := setupAdmissionLimiter(t, 0)
+	key := format.UserTag(onlineTag, "u-45")
+	if _, reject := l.CheckLimit(key, "203.0.113.7", true, true); reject {
+		t.Fatal("allowed")
+	}
+	a.Forget(1000000045) // 模拟会话在登记前被移除（与保活被拒效果相同）
+	if _, _, _, err := (&DefaultDispatcher{}).getLink(onlineCtx(context.Background(), "203.0.113.7"), net.Network_TCP); err != nil {
+		t.Fatal("getLink re-admits through CheckLimit, must succeed:", err)
+	}
+	// 直接验证登记后撤销判断：没有会话的受管链路
+	a.Forget(1000000045)
+	if !l.Revoked(key, "203.0.113.7") {
+		t.Fatal("must be revoked without session")
+	}
+	d := &DefaultDispatcher{}
+	revokeNext = func() { a.Forget(1000000045) }
+	t.Cleanup(func() { revokeNext = nil })
+	if _, _, _, err := d.getLink(onlineCtx(context.Background(), "203.0.113.8"), net.Network_TCP); err == nil {
+		t.Fatal("revoked link must fail")
+	}
+	if linkCount(d) != 0 {
+		t.Fatalf("revoked link left in manager: %d", linkCount(d))
+	}
+}
+
+// I4：admission_v1 下原本不限速的已有连接，原地改为限速后立即被限速，且连接未断开
+func TestExistingUnlimitedLinkLimitedAfterUpdate(t *testing.T) {
+	l, _, _ := setupAdmissionLimiter(t, 0)
+	d := &DefaultDispatcher{}
+	in, out, _, err := d.getLink(onlineCtx(context.Background(), "203.0.113.7"), net.Network_TCP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer common.Close(in.Writer)
+	go func() {
+		for {
+			mb, err := out.Reader.ReadMultiBuffer()
+			buf.ReleaseMulti(mb)
+			if err != nil {
+				return
+			}
+		}
+	}()
+	write := func(n int) time.Duration {
+		start := time.Now()
+		for n > 0 {
+			b := buf.New()
+			sz := min(n, int(b.Cap()))
+			b.Extend(int32(sz))
+			if err := in.Writer.WriteMultiBuffer(buf.MultiBuffer{b}); err != nil {
+				t.Fatal(err)
+			}
+			n -= sz
+		}
+		return time.Since(start)
+	}
+	if d := write(64 << 10); d > 300*time.Millisecond {
+		t.Fatalf("unlimited write took %v", d)
+	}
+	l.UpdateUserLimit(format.UserTag(onlineTag, "u-45"), 160000, 1) // 20000 B/s
+	if d := write(40000); d < 700*time.Millisecond {
+		t.Fatalf("limited write took %v, want ≥ ~1s", d)
+	}
+	if linkCount(d) != 1 {
+		t.Fatal("connection must stay open")
+	}
 }

@@ -3,6 +3,7 @@ package dispatcher
 import (
 	"strings"
 	sync "sync"
+	"sync/atomic"
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
@@ -11,8 +12,9 @@ import (
 type ManagedWriter struct {
 	writer  buf.Writer
 	manager *LinkManager
-	// release 活跃连接表（online_v1）与准入会话表（admission_v1）的释放函数，nil 表示未登记。可重复调用，只生效一次
-	release func()
+	// release 活跃连接表（online_v1）与准入会话表（admission_v1）的释放函数，未登记时为空。可重复调用，只生效一次。
+	// 准入保活被拒时会从其他 goroutine 关闭这条链路，所以用原子指针
+	release atomic.Pointer[func()]
 	// ip 链路的来源 IP（与 CheckLimit 同一来源，已去掉 IPv4 映射前缀），CloseByIP 按它匹配
 	ip string
 }
@@ -24,8 +26,14 @@ func normalizeLinkIP(ip string) string {
 
 // releaseOnline 从活跃连接表注销这条链路
 func (w *ManagedWriter) releaseOnline() {
-	if w.release != nil {
-		w.release()
+	if p := w.release.Load(); p != nil && *p != nil {
+		(*p)()
+	}
+}
+
+func (w *ManagedWriter) setRelease(release func()) {
+	if release != nil {
+		w.release.Store(&release)
 	}
 }
 
@@ -105,4 +113,30 @@ func (m *LinkManager) CloseByIP(ip string) {
 		common.Interrupt(r)
 		w.releaseOnline()
 	}
+}
+
+// CloseWriter 断开一条链路（准入保活被拒时由准入会话表调用，A2）：从管理表移除、关闭写端、打断读端、释放登记。
+// 链路还没加入（或管理器已 CloseAll）时用 fallback 作为读端
+func (m *LinkManager) CloseWriter(w *ManagedWriter, fallback buf.Reader) {
+	m.mu.Lock()
+	r, ok := m.links[w]
+	if ok {
+		delete(m.links, w)
+	}
+	m.mu.Unlock()
+	if !ok {
+		r = fallback
+	}
+	common.Close(w.writer)
+	if r != nil {
+		common.Interrupt(r)
+	}
+	w.releaseOnline()
+}
+
+// Len 管理中的链路数（排查、测试）
+func (m *LinkManager) Len() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return len(m.links)
 }
