@@ -345,3 +345,54 @@ func TestConcurrentAddAndFlush(t *testing.T) {
 	wg.Wait()
 	_ = r.FlushFatal(time.Second)
 }
+
+func TestResolveOnlyBatchesBounded(t *testing.T) {
+	path := t.TempDir() + "/spool.json"
+	s := &fakeSender{fail: alwaysFail}
+	r := NewReporter(Options{Sender: s, SpoolPath: path, Now: newClock().Now})
+	ctx := context.Background()
+	r.Add(ev(CodeCoreStart, 0, "a"))
+	for i := 0; i < 50; i++ {
+		r.Resolve(&nodev1.LogResolve{Scope: ScopeInbound, Protocol: "vless", Port: uint32(i % 3)})
+		_ = r.flush(ctx, false)
+	}
+	r.mu.Lock()
+	nb, nr := len(r.batches), len(r.resolves)
+	r.mu.Unlock()
+	if nb != 1 || nr != 3 {
+		t.Fatalf("批次数应有界: batches=%d resolves=%d", nb, nr)
+	}
+
+	// 留在待发中的 resolve 仍会被 FlushFatal 落盘
+	if err := r.FlushFatal(200 * time.Millisecond); err == nil {
+		t.Fatal("应返回错误")
+	}
+	reports, err := readSpool(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for _, rep := range reports {
+		n += len(rep.Resolves)
+	}
+	if n != 4 { // 首批已带 1 条 + 待发 3 条
+		t.Fatalf("spool 中 resolve 数 = %d", n)
+	}
+
+	// 前面的批次发完后，待发 resolve 在下一次 flush 带出
+	ok := &fakeSender{}
+	r.SetSender(ok)
+	if err := r.flush(ctx, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.flush(ctx, false); err != nil {
+		t.Fatal(err)
+	}
+	n = 0
+	for _, c := range ok.snapshot() {
+		n += len(c.Resolves)
+	}
+	if n != 4 {
+		t.Fatalf("发送的 resolve 数 = %d", n)
+	}
+}

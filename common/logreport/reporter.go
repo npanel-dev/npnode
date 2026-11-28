@@ -303,6 +303,12 @@ func (r *Reporter) buildBatchLocked(all bool) {
 	if len(evs) == 0 && len(r.resolves) == 0 {
 		return
 	}
+	// 没有事件且已有未发批次时，不单独为 resolve 建批：留在 resolveKey 中按键去重（数量有界），
+	// 等下一个事件批次或前面的批次发完再带出，避免 Sender 长期失败时批次无限累积。
+	// all（FlushFatal）时仍组批，保证 resolve 被发送或落盘。
+	if len(evs) == 0 && len(r.batches) > 0 && !all {
+		return
+	}
 	r.batches = append(r.batches, &nodev1.LogReport{
 		ReportId: r.newID(),
 		Events:   evs,
