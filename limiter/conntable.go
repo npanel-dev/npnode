@@ -17,6 +17,8 @@ const MaxOnlineIPsPerUID = 64
 type ConnTable struct {
 	mu sync.Mutex
 	m  map[connKey]*connEntry
+	// noReport 只为准入登记（未声明 online_v1）：不会有 Snapshot 来清理，计数归零即删除条目
+	noReport bool
 }
 
 type connKey struct {
@@ -60,8 +62,26 @@ func (t *ConnTable) close(k connKey) {
 		return
 	}
 	e.active--
+	if e.active == 0 && t.noReport {
+		delete(t.m, k)
+		return
+	}
 	// 计数归零不立即删除：这条链路本周期内在线过，下一次 Snapshot 还要上报一次
 	e.seen = true
+}
+
+// setReport 设置是否用于在线上报；改为不上报时删掉已归零、等待上报的条目
+func (t *ConnTable) setReport(report bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.noReport = !report
+	if !report {
+		for k, e := range t.m {
+			if e.active <= 0 {
+				delete(t.m, k)
+			}
+		}
+	}
 }
 
 // Snapshot 返回此刻在线的 (uid, ip)：计数 >0 或本周期出现过；同一 uid 最多 maxPerUID 个，活跃的优先。
@@ -158,13 +178,15 @@ var (
 	connTables   = map[string]*ConnTable{}
 )
 
-func connTableFor(tag string) *ConnTable {
+// connTableFor 取得入站的连接表；report 为是否用于在线上报（online_v1）
+func connTableFor(tag string, report bool) *ConnTable {
 	connTablesMu.Lock()
-	defer connTablesMu.Unlock()
 	t := connTables[tag]
 	if t == nil {
 		t = NewConnTable()
 		connTables[tag] = t
 	}
+	connTablesMu.Unlock()
+	t.setReport(report)
 	return t
 }

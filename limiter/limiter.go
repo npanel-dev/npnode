@@ -35,8 +35,20 @@ type Limiter struct {
 	AliveList     map[int]int    // Key: Uid, value: alive_ip
 	// BitPerSecond 声明了 seat_v1：speed_limit 按 bit/s 解释；否则按旧口径 Mbps 解释
 	BitPerSecond bool
-	// Conns 声明了 online_v1：活跃连接表，在线上报按它输出；未声明时为 nil，在线口径与旧版一致
+	// Conns 活跃连接表：声明了 online_v1 或 admission_v1 时建立（准入复用它的开、关钩子），都未声明时为 nil
 	Conns *ConnTable
+	// OnlineReport 声明了 online_v1：在线上报按活跃连接表输出；否则在线口径与旧版一致
+	OnlineReport bool
+	// Admission 声明了 admission_v1：进程级准入会话表，对 device_limit > 0 的条目准入；未声明时为 nil，CheckLimit 保持原逻辑
+	Admission *Admission
+	// Protocol、Port 本入站的协议和端口，准入请求带上
+	Protocol string
+	Port     int
+
+	tag string
+	// uidTags uid → 本入站的 taguuid（只在挂了准入时维护），关闭某 (uid, ip) 的全部连接时反查
+	idxMu   sync.RWMutex
+	uidTags map[int]map[string]struct{}
 }
 
 type UserLimitInfo struct {
@@ -50,6 +62,12 @@ type UserLimitInfo struct {
 }
 
 func AddLimiter(tag string, users []panel.UserInfo, aliveList map[int]int) *Limiter {
+	return AddInboundLimiter(tag, "", 0, users, aliveList)
+}
+
+// AddInboundLimiter 建立入站的限速器；protocol、port 用于准入请求（admission_v1）。
+// 声明了 admission_v1 且进程级准入实例已建立（EnsureAdmission）时挂上准入。
+func AddInboundLimiter(tag, protocol string, port int, users []panel.UserInfo, aliveList map[int]int) *Limiter {
 	info := &Limiter{
 		UserOnlineIP:  new(sync.Map),
 		UserLimitInfo: new(sync.Map),
@@ -57,12 +75,23 @@ func AddLimiter(tag string, users []panel.UserInfo, aliveList map[int]int) *Limi
 		AliveList:     aliveList,
 		OldUserOnline: new(sync.Map),
 		BitPerSecond:  panel.SeatV1Enabled(),
+		OnlineReport:  panel.OnlineV1Enabled(),
+		Protocol:      protocol,
+		Port:          port,
+		tag:           tag,
 	}
-	if panel.OnlineV1Enabled() {
-		info.Conns = connTableFor(tag)
+	if panel.AdmissionV1Enabled() {
+		info.Admission = CurrentAdmission()
+	}
+	if info.OnlineReport || info.Admission != nil {
+		info.Conns = connTableFor(tag, info.OnlineReport)
+	}
+	if info.Admission != nil {
+		info.uidTags = make(map[int]map[string]struct{})
 	}
 	uuidmap := make(map[string]int)
 	for i := range users {
+		info.indexUser(users[i].Id, format.UserTag(tag, users[i].Uuid))
 		uuidmap[users[i].Uuid] = users[i].Id
 		userLimit := &UserLimitInfo{}
 		userLimit.UID = users[i].Id
@@ -98,8 +127,56 @@ func DeleteLimiter(tag string) {
 	limitLock.Unlock()
 }
 
+// indexUser / unindexUser 维护 uid → taguuid 反查（只在挂了准入时）
+func (l *Limiter) indexUser(uid int, taguuid string) {
+	if l.uidTags == nil {
+		return
+	}
+	l.idxMu.Lock()
+	defer l.idxMu.Unlock()
+	m := l.uidTags[uid]
+	if m == nil {
+		m = make(map[string]struct{})
+		l.uidTags[uid] = m
+	}
+	m[taguuid] = struct{}{}
+}
+
+func (l *Limiter) unindexUser(uid int, taguuid string) {
+	if l.uidTags == nil {
+		return
+	}
+	l.idxMu.Lock()
+	defer l.idxMu.Unlock()
+	if m := l.uidTags[uid]; m != nil {
+		delete(m, taguuid)
+		if len(m) == 0 {
+			delete(l.uidTags, uid)
+		}
+	}
+}
+
+// TagUUIDsForUID 本进程所有挂了准入的入站上 uid 对应的 taguuid（LinkManagers 的键）
+func TagUUIDsForUID(uid int) []string {
+	limitLock.RLock()
+	defer limitLock.RUnlock()
+	var out []string
+	for _, l := range limiter {
+		if l.uidTags == nil {
+			continue
+		}
+		l.idxMu.RLock()
+		for k := range l.uidTags[uid] {
+			out = append(out, k)
+		}
+		l.idxMu.RUnlock()
+	}
+	return out
+}
+
 func (l *Limiter) UpdateUser(tag string, added []panel.UserInfo, deleted []panel.UserInfo) {
 	for i := range deleted {
+		l.unindexUser(deleted[i].Id, format.UserTag(tag, deleted[i].Uuid))
 		l.UserLimitInfo.Delete(format.UserTag(tag, deleted[i].Uuid))
 		l.UserOnlineIP.Delete(format.UserTag(tag, deleted[i].Uuid))
 		l.SpeedLimiter.Delete(format.UserTag(tag, deleted[i].Uuid))
@@ -120,6 +197,7 @@ func (l *Limiter) UpdateUser(tag string, added []panel.UserInfo, deleted []panel
 		userLimit.OverLimit = false
 		l.UserLimitInfo.Store(format.UserTag(tag, added[i].Uuid), userLimit)
 		l.UUIDtoUID[added[i].Uuid] = added[i].Id
+		l.indexUser(added[i].Id, format.UserTag(tag, added[i].Uuid))
 	}
 }
 
@@ -132,9 +210,19 @@ func (l *Limiter) UpdateUserLimit(taguuid string, speedLimit, deviceLimit int) {
 		return
 	}
 	nu := *v.(*UserLimitInfo)
+	oldDevice := nu.DeviceLimit
 	nu.SpeedLimit = speedLimit
 	nu.DeviceLimit = deviceLimit
 	l.UserLimitInfo.Store(taguuid, &nu)
+	if l.Admission != nil {
+		// 面板切换实时准入时名额条目的 device_limit 在 0/1 之间变化：关掉的立即 release，打开的对已有连接补 check
+		switch {
+		case oldDevice > 0 && deviceLimit <= 0:
+			l.Admission.Forget(nu.UID)
+		case oldDevice <= 0 && deviceLimit > 0:
+			l.Admission.Adopt(nu.UID, l.Protocol, l.Port)
+		}
+	}
 	ref, ok := l.SpeedLimiter.Load(taguuid)
 	if !ok {
 		return // 还没有连接建立过 bucket，下一次 CheckLimit 按新值建立
@@ -181,6 +269,11 @@ func (l *Limiter) CheckLimit(taguuid string, ip string, isTcp bool, noSSUDP bool
 	} else {
 		return nil, true
 	}
+	// 实时准入（admission_v1）：device_limit > 0 的条目由面板判定，本机设备判断不再生效（原逻辑也从未生效，aliveIp 恒为 0）
+	admitted := l.Admission != nil && deviceLimit > 0
+	if admitted && !l.Admission.Admit(uid, ip, deviceLimit, l.Protocol, l.Port) {
+		return nil, true
+	}
 	if noSSUDP {
 		// Store online user for device limit
 		ipMap := new(sync.Map)
@@ -191,7 +284,7 @@ func (l *Limiter) CheckLimit(taguuid string, ip string, isTcp bool, noSSUDP bool
 			ipMap := v.(*sync.Map)
 			// If this is a new ip
 			if _, ok := ipMap.LoadOrStore(ip, uid); !ok {
-				if deviceLimit > 0 {
+				if deviceLimit > 0 && !admitted {
 					if deviceLimit <= aliveIp {
 						ipMap.Delete(ip)
 						return nil, true
@@ -203,7 +296,7 @@ func (l *Limiter) CheckLimit(taguuid string, ip string, isTcp bool, noSSUDP bool
 				l.OldUserOnline.Delete(ip)
 			}
 		} else {
-			if deviceLimit > 0 {
+			if deviceLimit > 0 && !admitted {
 				if deviceLimit <= aliveIp {
 					l.UserOnlineIP.Delete(taguuid)
 					return nil, true
@@ -249,11 +342,11 @@ func speedLimitBytesPerSecond(speedLimit int, bitPerSecond bool) int64 {
 
 // ActiveOnline 在线上报是否按活跃连接口径（online_v1）
 func (l *Limiter) ActiveOnline() bool {
-	return l.Conns != nil
+	return l.Conns != nil && l.OnlineReport
 }
 
-// OpenConn 把一条已通过 CheckLimit 的链路登记到活跃连接表，返回释放函数（可重复、并发调用，只生效一次）。
-// 未声明 online_v1、用户不在限速器里、uid 无效或 IP 无法解析时返回 nil，不登记。
+// OpenConn 把一条已通过 CheckLimit 的链路登记到活跃连接表和准入会话表，返回释放函数（可重复、并发调用，只生效一次）。
+// 未声明 online_v1 和 admission_v1、用户不在限速器里、uid 无效或 IP 无法解析时返回 nil，不登记。
 // ip 与 CheckLimit 用同一个来源（已按可信 XFF / PROXY protocol 解析后的地址），去掉 IPv4 映射前缀。
 func (l *Limiter) OpenConn(taguuid string, ip string) (release func()) {
 	if l.Conns == nil {
@@ -271,7 +364,19 @@ func (l *Limiter) OpenConn(taguuid string, ip string) (release func()) {
 	if uid <= 0 {
 		return nil
 	}
-	return l.Conns.Open(uid, ip)
+	connRelease := l.Conns.Open(uid, ip)
+	if l.Admission == nil {
+		return connRelease
+	}
+	// 准入与连接表共用这一个钩子：同一条链路在两张表里同时登记、同时释放
+	admRelease := l.Admission.Open(uid, ip)
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			connRelease()
+			admRelease()
+		})
+	}
 }
 
 // GetOnlineDevice 本周期的在线 (uid, ip)。
@@ -280,7 +385,7 @@ func (l *Limiter) OpenConn(taguuid string, ip string) (release func()) {
 // 两种口径都会执行旧的读出清空，保证 CheckLimit 的设备数判断（OldUserOnline）与旧版一致，表也不会无限增长。
 func (l *Limiter) GetOnlineDevice() (*[]panel.OnlineUser, error) {
 	legacy := l.drainLegacyOnline()
-	if l.Conns != nil {
+	if l.ActiveOnline() {
 		snapshot := l.Conns.Snapshot(MaxOnlineIPsPerUID)
 		return &snapshot, nil
 	}
@@ -289,7 +394,7 @@ func (l *Limiter) GetOnlineDevice() (*[]panel.OnlineUser, error) {
 
 // RestoreOnline 在线上报失败：online_v1 口径下把这次读出的结果放回活跃连接表，下一周期补报；旧口径不做任何事（与旧版一致）
 func (l *Limiter) RestoreOnline(users []panel.OnlineUser) {
-	if l.Conns != nil {
+	if l.ActiveOnline() {
 		l.Conns.Restore(users)
 	}
 }
